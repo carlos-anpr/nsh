@@ -1,0 +1,6 @@
+/target
+
+# Credenciales y configuración con secretos: NUNCA al repo.
+config.toml
+*.key
+
