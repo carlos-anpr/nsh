@@ -1313,3 +1313,40 @@ limpios de avisos nuevos.
 Permanece la limitación documentada: SIGTERM no restaura el terminal (solo se
 registra SIGWINCH); cubierta por el test `limitacion_sigterm_no_restaura_termios`.
 
+---
+
+# PASO 25 - Segunda auditoría: bloqueos reales y cierre de sesión
+
+Segunda revisión externa tras el PASO 24. Seis hallazgos nuevos; todos
+corregidos. `cargo test`: **97 unitarios + 29 integración = 126 verdes, 0
+fallos, 6 ignored** (red/credenciales). `cargo clippy` sin avisos nuevos
+(los 11 previos ya existían).
+
+## P25.1 Hallazgos y correcciones
+
+| # | Gravedad | Hallazgo | Corrección |
+|---|----------|----------|------------|
+| 1 | Alta | `!unset PROMPT_COMMAND` eliminaba el emisor de marcadores y FASE 4 (sin timeout, a propósito) esperaba para siempre | `PROMPT_COMMAND` y `__nsh_hook` pasan a `readonly`/`readonly -f` en el rcfile: el unset falla dentro de bash (exit 1) y la sesión sigue sincronizada. Test de integración `hook_interno_readonly_la_sesion_sobrevive` |
+| 2 | Alta | Tras `!exit`, `!exec bash` o `kill` de la bash hija, nsh seguía pintando prompts sobre una shell muerta | `BashSession` lleva flag `alive()`: se pone a false al desconectarse el canal (shell muerta) y al vencer el timeout de FASE 1 (sincronía rota permanentemente, p. ej. `exec bash` que pierde nonce y hook). El REPL comprueba `alive()` tras cada comando y cierra limpio (termios restaurados). Tests: `exit_interno_cierra_nsh`, `exec_bash_cierra_nsh_por_perdida_de_sincronia` |
+| 3 | Media | `"@fichero con espacios.txt"` generaba comillas simples anidadas dentro de las dobles del usuario y el fichero no se encontraba | El resolver detecta `@` justo tras comilla de apertura (doble o simple) y, si la referencia cierra esa comilla, sustituye TODO el segmento (comillas incluidas) por la forma escapada de `shell_escape()`. Tests unitarios para comillas dobles, simples y el caso sin comilla de cierre |
+| 4 | Media | `MAX_MARKER_LEN = 4096` descartaba el marcador legitimo si el cwd rondaba PATH_MAX: el Base64 del cwd (~5462 bytes) desbordaba el tope y el parser lo emitía como salida, colgando la espera | Tope subido a 8192 (peor caso: PATH_MAX + Base64 + overhead). Test unitario `marcador_con_cwd_largo_no_se_descarta` y test de integración con un cwd real de ~4090 bytes |
+| 5 | Media | `build_file_sample()` leía cualquier ruta no directorio: una FIFO o dispositivo bloqueaba `read()` para siempre | Solo se leen ficheros regulares (`file_type().is_file()`); el resto devuelve una nota `FICHERO ESPECIAL` sin abrirlos. Tests con FIFO (mkfifo) y `/dev/null` |
+| 6 | Media | El timeout de MCP solo vencía la espera del llamante; el broker seguía bloqueado en `call_tool()` y encolaba para siempre las peticiones siguientes. Además el límite de salida se comprobaba tras concatenar todo | El bucle del broker envuelve `call_tool` (y `list_tools`) en `tokio::time::timeout` con el `timeout_ms` del conector: la tool colgada agota y el broker sigue atendiendo. `extract_textual_result` comprueba `max_output_bytes` de forma incremental, bloque a bloque |
+
+## P25.2 Limitación SIGTERM eliminada
+
+La limitación documentada desde el PASO 3 (`kill -TERM` dejaba el terminal en
+raw mode porque nsh solo registraba SIGWINCH) está resuelta: nsh registra
+SIGTERM y SIGHUP con `signal-hook::iterator`; a la primera señal fatal restaura
+los termios y sale con `128+sig`. SIGINT se excluye a propósito: en el prompt lo
+gestiona rustyline y durante un comando llega como byte `0x03` a la shell
+interna. El test `limitacion_sigterm_no_restaura_termios` se sustituye por
+`sigterm_restaura_termios`, que ahora exige terminal cocido tras el kill.
+
+## P25.3 Salida real
+
+- `cargo test` (2/2 corridas): 97 + 29 verdes, 6 ignored.
+- `cargo clippy`: 11 avisos, todos previos al PASO 24 (sin regresión).
+- Nota del test de cwd profundo: PATH_MAX (4096) es el TOTAL de la ruta, de
+  ahí que la prueba apunte a ~4090 bytes y no cree ficheros dentro.
+

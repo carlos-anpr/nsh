@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use config::Config;
-use llm::anthropic::AnthropicClient;
+use llm::anthropic::{AnthropicClient, OpenAiClient};
 use llm::{PlanOutcome, PlannedCommand, Planner, ShellContext};
 use mcp::Broker;
 use policy::Scope;
@@ -97,6 +97,22 @@ fn main() -> Result<()> {
     let flag = Arc::new(AtomicBool::new(false));
     let _ = WINCH.set(flag.clone());
     signal_hook::flag::register(signal_hook::consts::SIGWINCH, flag)?;
+
+    // SIGTERM/SIGHUP (kill, cierre de sesión): sin manejo, el proceso moriría
+    // con el terminal en raw mode. SIGINT se excluye deliberadamente: en el
+    // prompt lo gestiona rustyline (Ctrl+C no debe matar nsh) y durante un
+    // comando el Ctrl+C llega como byte 0x03 a la shell interna.
+    let mut fatales = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ])?;
+    std::thread::spawn(move || {
+        // La primera señal fatal restaura el terminal y mata nsh: no hay vuelta.
+        if let Some(sig) = fatales.forever().next() {
+            term::restore();
+            std::process::exit(128 + sig);
+        }
+    });
 
     let args: Vec<String> = std::env::args().collect();
     let load_bashrc = args.iter().any(|a| a == "--load-bashrc");
@@ -237,6 +253,10 @@ fn main() -> Result<()> {
                 CommandOrigin::Bang,
                 None,
             );
+            if !shell.alive() {
+                eprintln!("nsh: la shell interna ha terminado; cerrando nsh");
+                break;
+            }
             continue;
         }
 
@@ -263,6 +283,10 @@ fn main() -> Result<()> {
             &mut last_cmd,
             &mut last_output,
         );
+        if !shell.alive() {
+            eprintln!("nsh: la shell interna ha terminado; cerrando nsh");
+            break;
+        }
     }
 
     if let Some(broker) = &mcp_broker {
@@ -779,6 +803,29 @@ mod tests {
     }
 
     #[test]
+    fn muestra_de_fifo_no_bloquea() {
+        let tmp = TempDir::new().unwrap();
+        let fifo = tmp.path().join("tuberia");
+        unsafe {
+            // mkfifo con 0600: si build_file_sample intentara leerla, read()
+            // se bloquearia para siempre (este test colgaria: señal de regression).
+            let cpath = std::ffi::CString::new(fifo.as_os_str().to_str().unwrap()).unwrap();
+            assert_eq!(libc::mkfifo(cpath.as_ptr(), 0o600), 0);
+        }
+
+        let sample = build_file_sample(&fifo).unwrap();
+        assert!(sample.contains("FICHERO ESPECIAL"));
+        assert!(sample.contains("no es un fichero regular"));
+    }
+
+    #[test]
+    fn muestra_de_dispositivo_no_bloquea() {
+        // /dev/null es un dispositivo de caracteres: no es fichero regular.
+        let sample = build_file_sample(Path::new("/dev/null")).unwrap();
+        assert!(sample.contains("FICHERO ESPECIAL"));
+    }
+
+    #[test]
     fn l38_fichero_binario_no_inyecta_texto() {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("blob.bin");
@@ -786,13 +833,15 @@ mod tests {
         let sample = build_file_sample(&bin).unwrap();
         assert!(sample.contains("fichero binario"));
         assert!(sample.contains("4 bytes"));
-        assert_eq!(
-            sample,
-            format!(
-                "\n--- FICHERO: {} ---\nfichero binario, 4 bytes\n--- FIN FICHERO ---\n",
-                bin.display()
-            )
-        );
+        // El byte 0x41 ('A') no puede aparecer como contenido inyectado. La
+        // comparacion excluye la cabecera porque la ruta aleatoria del TempDir
+        // puede contener una 'A' que no viene del fichero.
+        let body = sample
+            .lines()
+            .filter(|l| !l.contains("FICHERO:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!body.contains('A'));
     }
 
     #[test]
@@ -1464,6 +1513,15 @@ es un directorio (primeras {} entradas):\n{}\n\
         ));
     }
 
+    // FIFOs, dispositivos y demás ficheros no regulares NO se leen: read() de
+    // una fifo vacía bloquearía toda la shell hasta que alguien escriba en ella.
+    if !meta.file_type().is_file() {
+        return Ok(format!(
+            "\n--- FICHERO ESPECIAL: {} ---\nno es un fichero regular (fifo, dispositivo u otro); no se lee\n--- FIN FICHERO ESPECIAL ---\n",
+            path.display()
+        ));
+    }
+
     // Devuelve (tamano, lineas si se conocen, lineas de muestra).
     let (size, total_lines, sample): (usize, Option<usize>, Vec<String>) =
         if meta.len() <= SMALL_FILE {
@@ -1646,6 +1704,23 @@ fn resolve_at_references(line: &str, cwd: &Path) -> Result<(String, Vec<String>)
                 continue;
             }
 
+            // @ justo tras una comilla de apertura: `"@fichero.txt"` o
+            // `'@fichero.txt'`. Si la referencia cierra comilla del mismo tipo,
+            // se sustituye TODO el segmento entrecomillado (comillas incluidas)
+            // por la forma escapada; si no, quedarían comillas simples anidadas
+            // dentro de las del usuario y el nombre con espacios no resolvería.
+            let comilla_apertura = line[..i]
+                .chars()
+                .next_back()
+                .filter(|c| matches!(c, '"' | '\''));
+            let en_comillas = comilla_apertura.is_some();
+            let cierra = |consumed: usize| -> bool {
+                match comilla_apertura {
+                    Some(q) => line[i + 1 + consumed..].starts_with(q),
+                    None => false,
+                }
+            };
+
             let mut best: Option<(usize, String)> = None;
             let mut boundaries: Vec<usize> = after.char_indices().map(|(idx, _)| idx).collect();
             boundaries.push(after.len());
@@ -1661,8 +1736,14 @@ fn resolve_at_references(line: &str, cwd: &Path) -> Result<(String, Vec<String>)
 
             if let Some((consumed, path_str)) = best {
                 referenced.push(path_str.clone());
-                result.push_str(&shell_escape(&path_str));
-                i += 1 + consumed;
+                if en_comillas && cierra(consumed) {
+                    result.pop(); // la comilla de apertura ya estaba en result
+                    result.push_str(&shell_escape(&path_str));
+                    i += 1 + consumed + 1; // consume tambien la comilla de cierre
+                } else {
+                    result.push_str(&shell_escape(&path_str));
+                    i += 1 + consumed;
+                }
                 continue;
             }
 
@@ -1754,18 +1835,21 @@ impl LlmState {
 
 fn build_planner(cfg: &Config) -> Result<Box<dyn Planner>> {
     let (_p, provider, mname) = cfg.resolve()?;
-    if provider.api != "anthropic" {
-        bail!(
-            "solo el estilo 'anthropic' esta soportado hoy (proveedor usa {:?})",
-            provider.api
-        );
-    }
     let key = provider.key()?;
-    Ok(Box::new(AnthropicClient::new(
-        &provider.base_url,
-        &key,
-        mname,
-    )))
+    match provider.api.as_str() {
+        "anthropic" => Ok(Box::new(AnthropicClient::new(
+            &provider.base_url,
+            &key,
+            mname,
+        ))),
+        "openai" => Ok(Box::new(OpenAiClient::new(
+            &provider.base_url,
+            &key,
+            mname,
+            provider.reasoning_effort.as_deref(),
+        ))),
+        other => bail!("estilo de API no soportado: {other:?}; usa 'anthropic' u 'openai'"),
+    }
 }
 
 fn handle_model_set(

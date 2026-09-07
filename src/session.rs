@@ -39,6 +39,11 @@ __nsh_hook() {
 }
 
 PROMPT_COMMAND=__nsh_hook
+# Readonly: si el usuario pudiera quitar el hook (`unset PROMPT_COMMAND`,
+# `unset -f __nsh_hook`, `PROMPT_COMMAND=...`), nsh dejaria de recibir
+# marcadores y la sesion se colgaria esperando el fin de comando.
+readonly PROMPT_COMMAND
+readonly -f __nsh_hook
 
 # nsh dibuja su propio prompt; bash no debe dibujar ninguno.
 PS1=''
@@ -78,6 +83,11 @@ pub struct BashSession {
     rx: Receiver<Event>,
     cwd: PathBuf,
     counter: u64,
+    /// false cuando la shell ya no puede sincronizarse: murió (EOF/`!exit`)
+    /// o alguien la sustituyó (`!exec bash`, que pierde nonce y hook). El
+    /// REPL consulta `alive()` para no seguir pintando prompts sobre un
+    /// cadáver.
+    alive: bool,
     /// Se mantiene vivo para que el fichero no se borre mientras bash existe.
     _rcfile: NamedTempFile,
 }
@@ -168,6 +178,7 @@ impl BashSession {
             rx,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             counter: 0,
+            alive: true,
             _rcfile: rcfile,
         };
 
@@ -180,6 +191,13 @@ impl BashSession {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// true mientras la shell interna pueda sincronizarse con nsh. Tras
+    /// `!exit`, `!exec bash` o un fallo de sincronía permanente devuelve false
+    /// y el REPL debe cerrar en vez de seguir pintando prompts.
+    pub fn alive(&self) -> bool {
+        self.alive
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -224,8 +242,14 @@ impl BashSession {
         // usuario manipulo NSH_ID/NSH_NONCE (o hizo `exec` de otra shell), el
         // marcador no llega y hay que devolver el prompt con error, no colgarse.
         // Esta espera ocurre ANTES de entrar en raw mode: el terminal queda sano.
+        // Si vence el timeout, la sincronía está rota de forma permanente (p. ej.
+        // `!exec bash` sustituyó la shell y perdió nonce y hook): la sesión ya no
+        // sirve y así se le comunica al REPL vía alive()=false.
         self.write_line(&format!("NSH_ID='{id}'"))?;
-        self.drain_until(&id, false, Some(Duration::from_secs(5)))?;
+        if let Err(e) = self.drain_until(&id, false, Some(Duration::from_secs(5))) {
+            self.alive = false;
+            return Err(e);
+        }
 
         // FASE 2 — raw mode + reenvio de teclado, ANTES de enviar el comando.
         let _raw = term::RawGuard::enter();
@@ -338,6 +362,7 @@ impl BashSession {
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    self.alive = false;
                     bail!("la shell ha terminado");
                 }
             }

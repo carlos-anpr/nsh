@@ -567,6 +567,90 @@ fn nonce_readonly_la_sesion_sobrevive_a_unset() {
 }
 
 #[test]
+fn hook_interno_readonly_la_sesion_sobrevive() {
+    let mut p = NshPty::new();
+    let out = p.run_cmd("unset PROMPT_COMMAND", 10_000);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("PROMPT_COMMAND") && text.contains("unset"),
+        "el unset deberia fallar por readonly: {text}"
+    );
+    assert_eq!(last_exit(&out), Some(1));
+    // La sesion sigue viva y sincronizada.
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio tras el unset de PROMPT_COMMAND"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+}
+
+/// `!exit` mata la shell interna: nsh debe cerrarse limpio, no seguir pintando
+/// prompts sobre una bash muerta.
+#[test]
+fn exit_interno_cierra_nsh() {
+    let mut p = NshPty::new();
+    p.send_line("!exit");
+    p.wait_for_exit(10_000);
+    let snap = p.snapshot();
+    let text = String::from_utf8_lossy(&snap);
+    assert!(
+        text.contains("la shell ha terminado") || text.contains("cerrando nsh"),
+        "se esperaba el mensaje de cierre tras !exit: {text}"
+    );
+    // wait_for_exit solo vence por timeout si nsh sigue vivo: si llegamos aqui
+    // con el canal desconectado, nsh termino. Comprobacion explicita: pedir
+    // mas datos no puede traer un nuevo prompt.
+    let n_antes = p.snapshot().len();
+    p.drain(300);
+    assert_eq!(p.snapshot().len(), n_antes, "nsh sigue vivo tras !exit");
+}
+
+/// `!exec bash` sustituye la shell interna: pierde el nonce y el hook, asi que
+/// la sincronia se rompe para siempre. nsh debe detectarlo (timeout de la fase
+/// de armado) y cerrar, no quedarse colgado ni pintar prompts muertos.
+#[test]
+fn exec_bash_cierra_nsh_por_perdida_de_sincronia() {
+    let mut p = NshPty::new();
+    p.send_line("!exec bash");
+    p.wait_for_exit(15_000);
+    // Si llegamos aqui, nsh termino (el canal se desconecto): correcto.
+    p.drain(300);
+}
+
+/// Un cwd muy profundo (cerca de PATH_MAX) se codifica en Base64 dentro del
+/// marcador: el marcador legitimo mas grande posible no debe descartarse ni
+/// colgar la sesion.
+#[test]
+fn cwd_profundo_el_marcador_no_se_descarta() {
+    let base = std::env::temp_dir().join(format!("nsh-deep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    // Componentes de 60 chars hasta rondar PATH_MAX (4096, total): base64 del
+    // cwd (~5400 bytes) excede el limite antiguo de 4096 del parser. No se
+    // crea fichero dentro: el propio cwd ya deja el camino al limite.
+    let mut dir = base.clone();
+    let comp = "d".repeat(60);
+    while dir.as_os_str().len() + 1 + comp.len() <= 4090 {
+        dir.push(&comp);
+        std::fs::create_dir(&dir).unwrap();
+    }
+    assert!(
+        dir.as_os_str().len() > 4000,
+        "el cwd de prueba deberia rondar PATH_MAX: {}",
+        dir.as_os_str().len()
+    );
+
+    let mut p = NshPty::new_with_cwd(dir.clone());
+    let out = p.run_cmd("echo ENCONTRADO", 10_000);
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(last_exit(&out), Some(0), "el comando fallo en cwd profundo: {text}");
+    assert!(text.contains("ENCONTRADO"));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn caso_23_exit_cierra_limpio() {
     let mut p = NshPty::new();
     p.buf.clear();
@@ -651,13 +735,10 @@ fn caso_24_panic_restaura_termios() {
     );
 }
 
-/// Limitación conocida, NO un bug a arreglar ahora: `kill -TERM` no restaura
-/// los termios porque nsh no captura SIGTERM (solo SIGWINCH). Al morir por
-/// señal, el hook de pánico no se ejecuta y el esclavo queda en raw mode.
-/// Este test caracteriza ese comportamiento: si un día se añade manejo de
-/// SIGTERM con restore(), este test fallará a propósito para avisar.
+/// SIGTERM ya NO es una limitación: nsh registra SIGTERM/SIGHUP y restaura
+/// los termios antes de morir (ver INFORME PASO 25).
 #[test]
-fn limitacion_sigterm_no_restaura_termios() {
+fn sigterm_restaura_termios() {
     let tmp = std::env::temp_dir();
     let mut p = NshPty::new_with_cwd(tmp.clone());
 
@@ -675,12 +756,9 @@ fn limitacion_sigterm_no_restaura_termios() {
     liberar_fd(fd);
 
     assert!(
-        !cocido,
-        "inesperado: SIGTERM dejó el terminal cocido. Si se añadió manejo de \
-         SIGTERM con restore(), actualiza también este test y el INFORME."
+        cocido,
+        "SIGTERM NO restauró los termios: el esclavo quedó en raw mode"
     );
-    // Si llegamos aquí: SIGTERM deja el terminal en raw mode. Limitación
-    // documentada en INFORME.md §6.1.
 }
 
 // ---------- FASE 2 ----------

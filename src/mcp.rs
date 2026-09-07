@@ -255,8 +255,15 @@ async fn run_broker(
                         }
                     }
                     Ok(out)
-                }
-                .await;
+                };
+                // El timeout de la peticion debe vencer AQUI tambien: si el
+                // broker se quedara esperando una tool colgada, las peticiones
+                // siguientes se quedarian encoladas para siempre aunque el
+                // llamante ya hubiera recibido su timeout.
+                let result = match tokio::time::timeout(STARTUP_TIMEOUT, result).await {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow!("timeout listando las tools del broker MCP")),
+                };
                 let _ = reply.send(result);
             }
             Request::CallTool {
@@ -265,6 +272,9 @@ async fn run_broker(
                 arguments,
                 reply,
             } => {
+                let cfg_timeout = states
+                    .get(&connector)
+                    .map(|s| Duration::from_millis(s.cfg.timeout_ms));
                 let result = async {
                     let state = states
                         .get_mut(&connector)
@@ -273,8 +283,16 @@ async fn run_broker(
                     let params = CallToolRequestParams::new(tool.clone()).with_arguments(arguments);
                     let result = state.running.peer().call_tool(params).await?;
                     extract_textual_result(result, state.cfg.tools.get(&tool))
-                }
-                .await;
+                };
+                let result = match cfg_timeout {
+                    Some(limit) => match tokio::time::timeout(limit, result).await {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow!(
+                            "timeout ({limit:?}) esperando a la tool {connector}.{tool}"
+                        )),
+                    },
+                    None => result.await,
+                };
                 let _ = reply.send(result);
             }
             Request::Shutdown { reply } => {
@@ -407,13 +425,11 @@ fn extract_textual_result(
             bail!("la tool devolvio contenido no textual; no se admite en este MVP");
         };
         text.push_str(&chunk.text);
-    }
-    if text.len() > max_output_bytes {
-        bail!(
-            "la tool devolvio {} bytes, por encima del limite de {}",
-            text.len(),
-            max_output_bytes
-        );
+        // Comprobacion incremental: sin ella, un conector que devuelva cientos
+        // de megabytes los acumularia en memoria enteros antes del chequeo.
+        if text.len() > max_output_bytes {
+            bail!("la tool devolvio contenido por encima del limite de {max_output_bytes} bytes");
+        }
     }
     Ok(ToolCallOutput {
         text,

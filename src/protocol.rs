@@ -6,7 +6,11 @@ const BEL: u8 = 0x07;
 const PREFIX: &[u8] = b"\x1b]777;nsh;";
 /// Si algo empieza como un marcador pero no cierra en este numero de bytes,
 /// se considera basura y se emite como salida normal. Evita bloqueos.
-const MAX_MARKER_LEN: usize = 4096;
+/// Debe superar el peor caso legitimo: PATH_MAX (4096) de cwd + base64 (x4/3
+/// = ~5462) + nonce + id + exit + prefijo. Con 4096 un cwd suficientemente
+/// profundo hacia que el parser descartara el marcador como basura y nsh
+/// esperara eternamente un fin de comando que ya habia llegado.
+const MAX_MARKER_LEN: usize = 8192;
 
 #[derive(Debug)]
 pub enum Event {
@@ -176,6 +180,23 @@ mod tests {
         assert!(p.push(b).is_empty());
         let ev = p.push(c);
         assert!(matches!(&ev[0], Event::Finished { id, .. } if id == "c9"));
+    }
+
+    #[test]
+    fn marcador_con_cwd_largo_no_se_descarta() {
+        // PATH_MAX (4096) de cwd + base64 (x4/3): el marcador legitimo mas
+        // grande posible debe parsear, no emitirse como salida.
+        let cwd_largo = "/".to_string() + &"a".repeat(4095);
+        let b64 = B64.encode(cwd_largo.as_bytes());
+        let m = marker("n1", "c1", 0, &b64);
+        assert!(m.len() > 4096, "el test deja de probar nada si el marcador cabe en el limite antiguo");
+
+        let mut p = Parser::new("n1");
+        let ev = p.push(&m);
+        match &ev[0] {
+            Event::Finished { cwd, .. } => assert_eq!(cwd, &PathBuf::from(cwd_largo)),
+            _ => panic!("el marcador con cwd largo se descarto: {:?}", ev.len()),
+        }
     }
 
     #[test]
