@@ -251,7 +251,7 @@ Los detalles que importan:
 - **Política en Rust, no en el prompt.** La clasificación usa un lexer de Bash propio; lo que el modelo "prometa" no cuenta. Ante la duda, siempre hacia el lado restrictivo.
 - **Cero permiso, cero confianza.** Los comandos `!` del usuario nunca pasan por política — son tus manos. La política solo vela los comandos planificados por el LLM.
 - **Secretos fuera del contexto.** Cuando el resultado de un comando toca rutas sensibles (`~/.ssh`, credenciales, tokens), `nsh` lo omite de las muestras automáticas que se envían al modelo — siguiendo también enlaces simbólicos. Configurable con `redact_sensitive_output` (defecto: activado).
-- **Sandbox honesto.** nsh no pretende aislar código hostil: la frontera real es un contenedor. El README técnico del código lo dice sin adornos, y lo repetimos aquí.
+- **Sandbox honesto.** nsh no pretende aislar código hostil: la frontera real es un contenedor. Lo decimos sin adornos y lo repetimos aquí.
 
 ## Arquitectura, para quien mira debajo del capó
 
