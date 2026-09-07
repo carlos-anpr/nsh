@@ -284,7 +284,7 @@ Los detalles que importan:
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Decisiones de diseño que un entrevistador querría oír:
+Decisiones de diseño que me importan:
 
 - **Sesión PTY real, no `bash -c` por comando.** Cada comando corre en una PTY pilotada con hilos de lectura y un protocolo de **dos marcadores en banda con nonce aleatorio** que separa la salida del comando del eco del prompt. Un marcador prematuro o falso no puede hacerse pasar por el fin de un comando, y el parser se resincroniza ante marcadores partidos entre lecturas. (27 tests solo de protocolo e integración PTY).
 - **Fail-fast de configuración.** El config TOML se valida entero al arrancar: proveedor inexistente, modelo no listado, permisos distintos de `0600` o `api_key` ausente abortan con un error accionable. Nada de arrancar a medias.
@@ -336,4 +336,4 @@ Sí; usa PTY estándar de Unix. Los tests de integración corren en Linux; en ma
 
 ## Licencia
 
-MIT — construido como proyecto de demostración técnica: cada decisión de diseño está tomada a conciencia y documentada en el propio código.
+MIT — cada decisión de diseño está tomada a conciencia y documentada en el propio código.
