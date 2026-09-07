@@ -279,13 +279,9 @@ fn looks_like_unhandled_glob(token: &str) -> bool {
     token.contains('/') || token.starts_with('.') || token.starts_with('~') || token.contains('.')
 }
 
-#[derive(Debug, Clone)]
-struct ResolvedPath {
-    logical: PathBuf,
-    materialized: PathBuf,
-}
-
-fn resolve_operand_path(token: &str, cwd: &Path) -> Option<ResolvedPath> {
+/// Resuelve un operando a ruta absoluta materializada (canonicalizada, con
+/// fallback a la normalizada si la canonicalizacion falla).
+fn resolve_operand_path(token: &str, cwd: &Path) -> Option<PathBuf> {
     let expanded = shellexpand::tilde(token).into_owned();
     let joined = if Path::new(&expanded).is_absolute() {
         PathBuf::from(&expanded)
@@ -293,11 +289,7 @@ fn resolve_operand_path(token: &str, cwd: &Path) -> Option<ResolvedPath> {
         cwd.join(&expanded)
     };
     let logical = normalize_absolute(&joined);
-    let materialized = canonicalize_with_fallback(&logical)?;
-    Some(ResolvedPath {
-        logical,
-        materialized,
-    })
+    canonicalize_with_fallback(&logical)
 }
 
 fn normalize_absolute(path: &Path) -> PathBuf {
@@ -339,6 +331,12 @@ fn canonicalize_with_fallback(path: &Path) -> Option<PathBuf> {
         resolved.push(part);
     }
     Some(resolved)
+}
+
+/// Comprueba tanto el nombre solicitado como el destino de un enlace simbólico.
+pub fn sensitive_context_path(path: &Path) -> Result<bool> {
+    Ok(is_sensitive_path(&normalize_absolute(path))
+        || is_sensitive_path(&path.canonicalize()?))
 }
 
 fn is_sensitive_path(path: &Path) -> bool {
@@ -412,6 +410,36 @@ fn split_segments(cmd: &str, scope: &Scope) -> Vec<SegmentAnalysis> {
             .unwrap_or(&tokens[0])
             .to_string();
         let in_find = analysis.base == "find";
+        if analysis.base == "sort" {
+            let mut args = tokens.iter().skip(1);
+            while let Some(arg) = args.next() {
+                if arg == "--" {
+                    break;
+                }
+                let destination = if arg.starts_with("--") {
+                    let (name, value) = arg.split_once('=').unwrap_or((arg, ""));
+                    // GNU sort acepta abreviaturas inequívocas de --output.
+                    if name.len() > 2 && "--output".starts_with(name) {
+                        Some(if value.is_empty() { args.next().map(String::as_str).unwrap_or("") } else { value })
+                    } else {
+                        None
+                    }
+                } else if let Some(flags) = arg.strip_prefix('-') {
+                    flags.find('o').map(|index| {
+                        let attached = &flags[index + 1..];
+                        if attached.is_empty() { args.next().map(String::as_str).unwrap_or("") } else { attached }
+                    })
+                } else {
+                    None
+                };
+                if let Some(destination) = destination {
+                    analysis.normal_write = true;
+                    if let Some(path) = maybe_resolve_path(destination, scope.roots()[0].as_path()) {
+                        analysis.writes_system_zone |= is_system_zone(&path);
+                    }
+                }
+            }
+        }
         let mut prev_was_find_pattern = false;
         let mut saw_o = false;
         let mut saw_recursive = false;
@@ -550,8 +578,7 @@ fn maybe_resolve_path(token: &str, cwd: &Path) -> Option<PathBuf> {
     if !looks_like_path(token, cwd) {
         return None;
     }
-    let resolved = resolve_operand_path(token, cwd)?;
-    Some(resolved.materialized)
+    resolve_operand_path(token, cwd)
 }
 
 fn is_download_and_exec(segments: &[SegmentAnalysis]) -> bool {
@@ -676,6 +703,18 @@ mod tests {
 
     fn scope_with_extra(cwd: &Path, extra: &[PathBuf]) -> Scope {
         Scope::new(cwd, extra)
+    }
+
+    #[test]
+    fn sort_output_requires_confirmation_even_when_model_says_readonly() {
+        let tmp = TempDir::new().unwrap();
+        for option in ["-o result", "-oresult", "-ro result", "--output result", "--output=result", "--out=result"] {
+            let command = format!("sort {option} input");
+            assert!(matches!(evaluate(&cmd(&command, Effect::ReadOnly), &scope(tmp.path())), Decision::Confirm(_)), "{command}");
+        }
+        assert!(matches!(evaluate(&cmd("sort -nr input", Effect::ReadOnly), &scope(tmp.path())), Decision::Allow));
+        assert!(matches!(evaluate(&cmd("sort -- -output", Effect::ReadOnly), &scope(tmp.path())), Decision::Allow));
+        assert!(matches!(evaluate(&cmd("sort --output=/etc/nsh-review-example input", Effect::ReadOnly), &scope(tmp.path())), Decision::Deny(_)));
     }
 
     // L4 — ReadOnly + primer token en la allowlist -> Allow.

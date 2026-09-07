@@ -85,7 +85,6 @@ const MAX_CAPTURE: usize = 256 * 1024;
 
 pub struct CommandResult {
     pub exit_code: i32,
-    pub cwd: PathBuf,
     pub output: Vec<u8>,
     pub truncated: bool,
 }
@@ -357,11 +356,10 @@ impl BashSession {
                     cwd,
                 }) => {
                     if fid == id {
-                        self.cwd = cwd.clone();
+                        self.cwd = cwd;
                         return Ok(if capture {
                             Some(CommandResult {
                                 exit_code,
-                                cwd,
                                 output: out,
                                 truncated,
                             })
