@@ -385,12 +385,21 @@ mod tests {
         }
     }
 
-    fn client_from_config() -> AnthropicClient {
+    fn client_from_config() -> Box<dyn Planner> {
         let cfg = crate::config::Config::load()
             .expect("necesitas ~/.config/nsh/config.toml (chmod 600) con la key real");
         let (_p, provider, mname) = cfg.resolve().expect("resolve");
         let key = provider.key().expect("key");
-        AnthropicClient::new(&provider.base_url, &key, mname)
+        match provider.api.as_str() {
+            "anthropic" => Box::new(AnthropicClient::new(&provider.base_url, &key, mname)),
+            "openai" => Box::new(crate::llm::openai::OpenAiClient::new(
+                &provider.base_url,
+                &key,
+                mname,
+                provider.reasoning_effort.as_deref(),
+            )),
+            other => panic!("estilo de API no soportado en test real: {other}"),
+        }
     }
 
     #[test]

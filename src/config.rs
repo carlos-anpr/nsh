@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
     pub base_url: String,
-    /// "anthropic" (unico soportado hoy). Campo abierto para "openai" mas adelante.
+    /// Estilo de API compatible: "anthropic" u "openai".
     pub api: String,
     #[serde(default)]
     pub api_key: Option<String>,
@@ -14,6 +14,9 @@ pub struct Provider {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Esfuerzo de razonamiento para APIs que lo soportan (p.ej. Ollama).
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

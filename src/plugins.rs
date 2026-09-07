@@ -241,6 +241,7 @@ mod tests {
                     api_key: None,
                     api_key_env: None,
                     models: vec!["glm-4.6".into()],
+                    reasoning_effort: None,
                 },
             )]),
             completion: "fuzzy".into(),

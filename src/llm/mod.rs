@@ -52,3 +52,4 @@ pub trait Planner {
 }
 
 pub mod anthropic;
+pub mod openai;

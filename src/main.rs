@@ -20,7 +20,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use config::Config;
-use llm::anthropic::{AnthropicClient, OpenAiClient};
+use llm::anthropic::AnthropicClient;
+use llm::openai::OpenAiClient;
 use llm::{PlanOutcome, PlannedCommand, Planner, ShellContext};
 use mcp::Broker;
 use policy::Scope;
