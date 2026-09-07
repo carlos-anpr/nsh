@@ -2,6 +2,17 @@
 
 Wrapper en Rust sobre una **bash interactiva persistente**.
 
+## Demo de uso
+
+![Demo de nsh: comandos Bash con !, petición al LLM y explicación con /why](docs/demo/nsh-demo.gif)
+
+Demo ilustrativa de 15 segundos con datos ficticios: `!ls` explora los logs;
+el LLM busca errores 500 de `/api/pagos`, excluye pruebas y agrupa por IP.
+`/why` interpreta qué IP concentra más errores y explica los filtros.
+Se reproduce en bucle. [Ver imagen estática](docs/demo/nsh-demo-preview.png).
+
+El guion reproducible está en [docs/demo/generate.py](docs/demo/generate.py).
+
 La finalización de cada comando se verifica con una barrera de Bash de
 identificador aleatorio: imprimir el marcador de sesión no adelanta el prompt
 ni sustituye el código de salida real. El parser se resincroniza si encuentra
