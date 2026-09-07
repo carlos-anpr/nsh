@@ -25,17 +25,29 @@ NSH_ID='boot'
 
 # PS0 se expande DESPUES de leer el comando y ANTES de ejecutarlo.
 # Reactiva el eco para que `read -p`, `npm init`, `apt` etc. muestren lo que
-# teclea el usuario. La sustitucion no imprime nada.
-PS0='$(stty echo)'
+# teclea el usuario. La sustitucion no imprime nada. `command -p` por la misma
+# razon que en __nsh_hook. Readonly: PS0 ejecuta codigo antes de cada comando,
+# y reasignado por el usuario podria redefinir el hook o hacer `exec bash`.
+PS0='$(command -p stty echo 2>/dev/null)'
+readonly PS0
 
 __nsh_hook() {
-    local s=$?          # OBLIGATORIO que sea la PRIMERA linea del cuerpo
-    stty -echo          # vuelve a apagar el eco antes del siguiente comando
-    printf '\033]777;nsh;%s;%s;%d;%s\007' \
+    # Sin `local`: una funcion llamada `local` (definible por el usuario)
+    # sombrearia el builtin y dejaria vacio el codigo de salida.
+    __nsh_s=$?
+    # El hook debe emitir su marcador SIEMPRE, venga lo que venga del comando
+    # anterior. `builtin printf` inmuniza contra funciones/alias que sombreen
+    # printf (p. ej. `printf(){ :; }`) y `command -p` busca stty/base64 en el
+    # PATH por defecto del sistema, ignorando funciones, alias y cambios de
+    # PATH. Si base64 no existiera, el cwd llega vacio pero el marcador se
+    # emite igualmente: nunca puede quedarse sin emitir.
+    command -p stty -echo 2>/dev/null
+    __nsh_cwd64=$(builtin printf %s "$PWD" | command -p base64 -w0)
+    builtin printf '\033]777;nsh;%s;%s;%d;%s\007' \
         "$NSH_NONCE" \
         "$NSH_ID" \
-        "$s" \
-        "$(printf %s "$PWD" | base64 -w0)"
+        "$__nsh_s" \
+        "${__nsh_cwd64:0:5460}"
 }
 
 PROMPT_COMMAND=__nsh_hook
@@ -371,6 +383,34 @@ impl BashSession {
 
     pub fn shutdown(&mut self) {
         let _ = self.write_line("exit");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RCFILE_TEMPLATE;
+
+    /// El hook se emite con `builtin` y busca externos con `command -p`: sin
+    /// eso, `!printf(){ :; }` o un cambio de PATH dejan el hook mudo y nsh
+    /// espera eternamente un marcador que nunca llega (FASE 4 no tiene
+    /// timeout a proposito). Y PS0 readonly: podria ejecutar codigo arbitrario
+    /// antes de cada comando.
+    #[test]
+    fn hook_endurecido_contra_sombra_de_funciones() {
+        assert!(RCFILE_TEMPLATE.contains("builtin printf"));
+        assert!(RCFILE_TEMPLATE.contains("command -p stty"));
+        assert!(RCFILE_TEMPLATE.contains("command -p base64"));
+        assert!(RCFILE_TEMPLATE.contains("readonly PS0"));
+        assert!(RCFILE_TEMPLATE.contains("readonly PROMPT_COMMAND"));
+        assert!(RCFILE_TEMPLATE.contains("readonly -f __nsh_hook"));
+    }
+
+    /// El Base64 del cwd se corta a 5460 chars (4095 bytes decodificados): un
+    /// PWD artificial gigante no puede superar el MAX_MARKER_LEN (8192) del
+    /// parser y colgar la espera del marcador.
+    #[test]
+    fn cwd_del_marcador_acotado() {
+        assert!(RCFILE_TEMPLATE.contains("${__nsh_cwd64:0:5460}"));
     }
 }
 

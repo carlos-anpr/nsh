@@ -650,6 +650,60 @@ fn cwd_profundo_el_marcador_no_se_descarta() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// El hook usa `builtin printf` y `command -p stty/base64`: una función del
+/// usuario que sombree `printf` no deja el hook mudo (antes nsh quedaba
+/// esperando eternamente el marcador de fin de ese comando).
+#[test]
+fn hook_sobrevive_a_sombra_de_printf() {
+    let mut p = NshPty::new();
+    // Antes del endurecimiento, ESTE comando ya no recibia marcador: el hook
+    // llamaba al printf sombreado y run_cmd agotaba su timeout.
+    let out = p.run_cmd("printf(){ :; }", 10_000);
+    assert_eq!(last_exit(&out), Some(0));
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio tras sombrear printf"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+}
+
+/// `command -p` busca stty/base64 en el PATH por defecto del sistema: un PATH
+/// inutilizado por el usuario tampoco rompe el hook.
+#[test]
+fn hook_sobrevive_a_path_inutilizado() {
+    let mut p = NshPty::new();
+    let out = p.run_cmd("PATH=/no/existe", 10_000);
+    assert_eq!(last_exit(&out), Some(0));
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio con PATH roto"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+    // Restablecer para no dejar la sesión coja.
+    let _ = p.run_cmd("PATH=$PATH", 10_000);
+}
+
+/// Un PWD artificial gigante (variable, sin límite de PATH_MAX) no puede
+/// superar el MAX_MARKER_LEN del parser: el hook corta su Base64 y el marcador
+/// siempre cabe. Antes, el parser descartaba el marcador como basura y nsh se
+/// quedaba esperando el fin de comando para siempre.
+#[test]
+fn pwd_artificial_gigante_no_rompe_el_marcador() {
+    let mut p = NshPty::new();
+    let out = p.run_cmd("PWD=$(printf 'a%.0s' {1..20000})", 10_000);
+    assert_eq!(last_exit(&out), Some(0));
+    // El marcador llegó (run_cmd no agotó timeout) y la sesión sigue viva.
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio tras el PWD gigante"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+    let _ = p.run_cmd("cd /tmp", 10_000);
+}
+
 #[test]
 fn caso_23_exit_cierra_limpio() {
     let mut p = NshPty::new();

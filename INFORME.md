@@ -1350,3 +1350,71 @@ interna. El test `limitacion_sigterm_no_restaura_termios` se sustituye por
 - Nota del test de cwd profundo: PATH_MAX (4096) es el TOTAL de la ruta, de
   ahí que la prueba apunte a ~4090 bytes y no cree ficheros dentro.
 
+---
+
+# PASO 26 - Tercera auditoría: el hook a prueba de sombras y el PWD gigante
+
+Tercera revisión externa. Dos hallazgos, ambos sobre vectores que dejaban el
+hook mudo y a nsh esperando eternamente un marcador (FASE 4 no tiene timeout a
+propósito: debe admitir `sleep`, `top`, `vim`...). `cargo test`: **99
+unitarios + 32 integración = 131 verdes, 0 fallos, 6 ignored**. `cargo clippy`
+sin avisos nuevos (los 11 previos ya existían).
+
+## P26.1 Hallazgos y correcciones
+
+| # | Gravedad | Hallazgo | Corrección |
+|---|----------|----------|------------|
+| 1 | Alta | `!printf(){ :; }` sombreaba `printf`, que el hook usa para emitir el marcador: sin marcador, nsh esperaba indefinidamente. Lo mismo con `stty`/`base64` redefinidos o con un PATH inutilizado. Además `local` era sombreable y dejaba vacío el código de salida | El hook se endurece: `builtin printf` (inmune a funciones y alias) para la emisión, `command -p stty/base64` (PATH por defecto del sistema, ignora funciones/alias/PATH) para los externos, sin `local` (asignación global `__nsh_s`). Si `base64` no existiera, el cwd llega vacío pero el marcador se emite igualmente: el hook ya no puede quedarse mudo por sombreado. `PS0` pasa a `readonly` (ejecuta código antes de cada comando; reasignado podía redefinir el hook o hacer `exec bash`) y usa `command -p stty` |
+| 2 | Media | Un `PWD` artificial (>16 KiB, variable libre sin límite de PATH_MAX) generaba un marcador mayor que `MAX_MARKER_LEN` (8192): el parser lo descartaba como basura y nsh esperaba para siempre | El hook corta el Base64 del cwd a 5460 chars (`${__nsh_cwd64:0:5460}`, múltiplo de 4 y sin `=` ⇒ decodifica 4095 bytes validos como prefijo del cwd real). Marcador máximo ~5,5 KiB < 8192; los cwd legitimos (≤ PATH_MAX) llegan íntegros. El tope del parser queda como segunda barrera |
+
+## P26.2 Tests de regresión
+
+- Unitarios (`session.rs`): `hook_endurecido_contra_sombra_de_funciones`,
+  `cwd_del_marcador_acotado`.
+- Integración: `hook_sobrevive_a_sombra_de_printf` (el propio comando que
+  sombrea ya recibe su marcador), `hook_sobrevive_a_path_inutilizado`,
+  `pwd_artificial_gigante_no_rompe_el_marcador`.
+
+## P26.3 Residual documentado
+
+Sombrear el propio builtin `builtin` (p. ej. `builtin(){ :; }`) silenciaría la
+emisión del marcador: es un vector deliberadamente hostil contra el arnés (no
+un efecto colateral de un comando legitimo como `printf(){ :; }`). Sombrear
+`command` solo degrada el cwd (el marcador se emite igual, con cwd vacío). En
+el caso extremo, el siguiente comando detecta la ausencia de marcador por el
+timeout de FASE 1 (5 s) y cierra nsh limpio en vez de colgarse. No se protege
+más el arnés para no obsurecer el rcfile.
+---
+
+# PASO 26 - Tercera auditoría: el hook a prueba de sombras y el PWD gigante
+
+Tercera revisión externa. Dos hallazgos, ambos sobre vectores que dejaban el
+hook mudo y a nsh esperando eternamente un marcador (FASE 4 no tiene timeout a
+propósito: debe admitir `sleep`, `top`, `vim`...). `cargo test`: **99
+unitarios + 32 integración = 131 verdes, 0 fallos, 6 ignored**. `cargo clippy`
+sin avisos nuevos (los 11 previos ya existían).
+
+## P26.1 Hallazgos y correcciones
+
+| # | Gravedad | Hallazgo | Corrección |
+|---|----------|----------|------------|
+| 1 | Alta | `!printf(){ :; }` sombreaba `printf`, que el hook usa para emitir el marcador: sin marcador, nsh esperaba indefinidamente. Lo mismo con `stty`/`base64` redefinidos o con un PATH inutilizado. Además `local` era sombreable y dejaba vacío el código de salida | El hook se endurece: `builtin printf` (inmune a funciones y alias) para la emisión, `command -p stty/base64` (PATH por defecto del sistema, ignora funciones/alias/PATH) para los externos, sin `local` (asignación global `__nsh_s`). Si `base64` no existiera, el cwd llega vacío pero el marcador se emite igualmente: el hook ya no puede quedarse mudo por sombreado. `PS0` pasa a `readonly` (ejecuta código antes de cada comando; reasignado podía redefinir el hook o hacer `exec bash`) y usa `command -p stty` |
+| 2 | Media | Un `PWD` artificial (>16 KiB, variable libre sin límite de PATH_MAX) generaba un marcador mayor que `MAX_MARKER_LEN` (8192): el parser lo descartaba como basura y nsh esperaba para siempre | El hook corta el Base64 del cwd a 5460 chars (`${__nsh_cwd64:0:5460}`, múltiplo de 4 y sin `=` ⇒ decodifica 4095 bytes validos como prefijo del cwd real). Marcador máximo ~5,5 KiB < 8192; los cwd legitimos (≤ PATH_MAX) llegan íntegros. El tope del parser queda como segunda barrera |
+
+## P26.2 Tests de regresión
+
+- Unitarios (`session.rs`): `hook_endurecido_contra_sombra_de_funciones`,
+  `cwd_del_marcador_acotado`.
+- Integración: `hook_sobrevive_a_sombra_de_printf` (el propio comando que
+  sombrea ya recibe su marcador), `hook_sobrevive_a_path_inutilizado`,
+  `pwd_artificial_gigante_no_rompe_el_marcador`.
+
+## P26.3 Residual documentado
+
+Sombrear el propio builtin `builtin` (p. ej. `builtin(){ :; }`) silenciaría la
+emisión del marcador: es un vector deliberadamente hostil contra el arnés (no
+un efecto colateral de un comando legitimo como `printf(){ :; }`). Sombrear
+`command` solo degrada el cwd (el marcador se emite igual, con cwd vacío). En
+el caso extremo, el siguiente comando detecta la ausencia de marcador por el
+timeout de FASE 1 (5 s) y cierra nsh limpio en vez de colgarse. No se protege
+más el arnés para no obsurecer el rcfile.
