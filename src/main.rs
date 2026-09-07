@@ -108,11 +108,22 @@ fn main() -> Result<()> {
     }
     let mut shell = session::BashSession::start(load_bashrc)?;
     let mut llm_state = LlmState::load();
-    let mut mcp_broker = llm_state
+    // Un conector MCP opcional roto (binario inexistente, timeout, ...) no puede
+    // impedir arrancar la shell: se avisa y se sigue sin broker. El pre-paso
+    // documental ya da error accionable (/plugins install ...) en ese caso.
+    let mut mcp_broker: Option<Broker> = match llm_state
         .config
         .as_ref()
         .and_then(|cfg| Broker::from_config(cfg, shell.cwd()).transpose())
-        .transpose()?;
+        .transpose()
+    {
+        Ok(broker) => broker,
+        Err(e) => {
+            eprintln!("nsh: MCP no disponible en esta sesión: {e:#}");
+            eprintln!("      (! y el LLM siguen funcionando; /plugins list para ver el estado)");
+            None
+        }
+    };
 
     let completion_type = match llm_state.config.as_ref().map(|c| c.completion.as_str()) {
         Some("list") => CompletionType::List,
@@ -182,7 +193,13 @@ fn main() -> Result<()> {
             continue;
         }
         if line == "/why" {
-            handle_why(&mut llm_state, &recent, &last_cmd, &last_output);
+            handle_why(
+                &mut llm_state,
+                shell.cwd(),
+                &recent,
+                &last_cmd,
+                &last_output,
+            );
             continue;
         }
         if line == "/plugins" || line.starts_with("/plugins ") {
@@ -307,11 +324,11 @@ mod tests {
 
         let entries = list_dir_entries(path);
 
-        assert_eq!(entries.len(), 200);
-        // Debe haber una línea que indica "… y 50 más"
-        // Nota: esta línea NO está en entries, se añade en system_prompt
-        // así que solo verificamos que hay 200 entradas
-        assert!(entries.iter().all(|e| e.starts_with("file_")));
+        assert_eq!(entries.len(), 201);
+        // La ultima linea avisa de cuantas faltan para que el modelo no crea
+        // que la lista es completa.
+        assert_eq!(entries[200], "… y 50 más");
+        assert!(entries[..200].iter().all(|e| e.starts_with("file_")));
     }
 
     #[test]
@@ -348,8 +365,64 @@ mod tests {
         let (expanded, referenced) =
             resolve_at_references("@fichero con espacios.txt", path).unwrap();
 
-        assert_eq!(expanded, "\"fichero con espacios.txt\"");
+        assert_eq!(expanded, "'fichero con espacios.txt'");
         assert_eq!(referenced, vec!["fichero con espacios.txt"]);
+    }
+
+    #[test]
+    fn resolve_at_references_escapa_comilla_simple() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path();
+
+        fs::write(path.join("it's.txt"), "x").unwrap();
+
+        let (expanded, referenced) = resolve_at_references("@it's.txt", path).unwrap();
+
+        assert_eq!(expanded, "'it'\\''s.txt'");
+        assert_eq!(referenced, vec!["it's.txt"]);
+    }
+
+    #[test]
+    fn resolve_at_references_neutraliza_inyeccion_en_nombre() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path();
+
+        let evil = "evil\"; echo INYECTADO; \"";
+        fs::write(path.join(evil), "x").unwrap();
+
+        let (expanded, referenced) =
+            resolve_at_references(&format!("@{evil}"), path).unwrap();
+
+        // El nombre viaja dentro de comillas simples: ni `;` ni `"` ni `$`
+        // pueden romper al comando que lo interpola.
+        assert_eq!(expanded, format!("'{evil}'"));
+        assert_eq!(referenced, vec![evil.to_string()]);
+    }
+
+    #[test]
+    fn resolve_at_references_email_pasa_intacto() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path();
+
+        let (expanded, referenced) =
+            resolve_at_references("printf '%s\\n' user@example.com", path).unwrap();
+
+        assert_eq!(expanded, "printf '%s\\n' user@example.com");
+        assert!(referenced.is_empty());
+    }
+
+    #[test]
+    fn resolve_at_references_tras_igual_sigue_resolviendo() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path();
+
+        fs::write(path.join("dato.txt"), "x").unwrap();
+
+        let (expanded, referenced) =
+            resolve_at_references("VAR=@dato.txt", path).unwrap();
+
+        assert_eq!(expanded, "VAR=dato.txt");
+        assert_eq!(referenced, vec!["dato.txt"]);
     }
 
     #[test]
@@ -713,7 +786,13 @@ mod tests {
         let sample = build_file_sample(&bin).unwrap();
         assert!(sample.contains("fichero binario"));
         assert!(sample.contains("4 bytes"));
-        assert!(!sample.contains("A"));
+        assert_eq!(
+            sample,
+            format!(
+                "\n--- FICHERO: {} ---\nfichero binario, 4 bytes\n--- FIN FICHERO ---\n",
+                bin.display()
+            )
+        );
     }
 
     #[test]
@@ -724,6 +803,67 @@ mod tests {
         fs::write(&log, format!("{line}\n{line}\n{line}\n")).unwrap();
         let sample = build_file_sample(&log).unwrap();
         assert!(sample.len() <= 4096 + "--- FIN FICHERO ---\n".len());
+    }
+
+    #[test]
+    fn recortar_no_parte_caracter_multibyte() {
+        // 751 eñes = 1502 bytes (> LAST_OUTPUT_CAP): el corte cae dentro de un
+        // caracter si se cuenta por bytes. Antes: panic en produccion.
+        let bytes = "é".repeat(751).into_bytes();
+        assert!(bytes.len() > LAST_OUTPUT_CAP);
+        let out = recortar(&bytes);
+        assert!(out.starts_with('…'));
+        assert!(out.chars().count() <= LAST_OUTPUT_CAP + 1);
+    }
+
+    #[test]
+    fn truncate_line_no_parte_emoji() {
+        // 239 ASCII + emoji de 4 bytes: el limite 240 cae dentro del emoji.
+        let line = format!("{}🎉", "a".repeat(239));
+        assert!(line.len() > 240);
+        let out = truncate_line(&line);
+        assert!(out.ends_with("..."));
+        assert!(out.len() < line.len());
+    }
+
+    #[test]
+    fn truncate_string_respeta_limite_utf8() {
+        let mut s = "é".repeat(100);
+        truncate_string(&mut s, 101);
+        assert_eq!(s, "é".repeat(50));
+    }
+
+    #[test]
+    fn muestra_de_directorio_no_falla() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sub");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+
+        let sample = build_file_sample(&dir).unwrap();
+        assert!(sample.contains("es un directorio"));
+        assert!(sample.contains("a.txt"));
+    }
+
+    #[test]
+    fn muestra_de_fichero_grande_esta_acotada() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("grande.log");
+        let mut content = String::from("PRIMERA_LINEA\n");
+        for i in 0..5000 {
+            content.push_str(&format!("linea de relleno numero {i}\n"));
+        }
+        content.push_str("ULTIMA_LINEA\n");
+        std::fs::write(&log, &content).unwrap();
+        assert!(content.len() > 64 * 1024);
+
+        let sample = build_file_sample(&log).unwrap();
+        assert!(sample.contains("PRIMERA_LINEA"));
+        assert!(sample.contains("ULTIMA_LINEA"));
+        assert!(sample.contains("... <corte> ..."));
+        assert!(sample.contains("muestra parcial"));
+        // 32 KiB de cabeza + 8 KiB de cola entran; el cuerpo nunca crece sin cota.
+        assert!(sample.len() < 64 * 1024);
     }
 
     #[test]
@@ -768,7 +908,7 @@ fn run_command(
                 text: recortar(&r.output),
                 sensitive: redact_sensitive_output && analysis.redact_output,
             });
-            maybe_interpret_output(origin, llm, recent, last_cmd, last_output);
+            maybe_interpret_output(origin, llm, shell.cwd(), recent, last_cmd, last_output);
         }
         Err(e) => {
             eprintln!("nsh: {e}");
@@ -786,11 +926,26 @@ fn push_recent(recent: &mut Vec<(String, i32)>, cmd: &str, code: i32) {
 fn recortar(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
     if s.len() > LAST_OUTPUT_CAP {
-        let start = s.len() - LAST_OUTPUT_CAP;
+        // Retroceder hasta un limite de caracter: cortar por indice de byte
+        // en mitad de un caracter multibyte provoca panic.
+        let mut start = s.len() - LAST_OUTPUT_CAP;
+        while start < s.len() && !s.is_char_boundary(start) {
+            start += 1;
+        }
         format!("…{}", &s[start..])
     } else {
         s.into_owned()
     }
+}
+
+/// Trunca un String a como maximo `max` bytes sin partir un caracter UTF-8.
+/// (String::truncate() hace panic si `max` cae dentro de un caracter.)
+fn truncate_string(s: &mut String, max: usize) {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
 }
 
 // ===================== Camino del LLM =====================
@@ -1016,6 +1171,7 @@ fn handle_fix(
 fn maybe_interpret_output(
     origin: CommandOrigin,
     llm: Option<&LlmState>,
+    cwd: &Path,
     recent: &[(String, i32)],
     last_cmd: &Option<String>,
     last_output: &Option<LastOutput>,
@@ -1032,13 +1188,14 @@ fn maybe_interpret_output(
         InterpretOutputMode::Hint => println!("  · /why para interpretar la salida"),
         InterpretOutputMode::Auto => {
             println!("  · /why para interpretar la salida");
-            handle_why_auto(llm, recent, last_cmd, last_output);
+            handle_why_auto(llm, cwd, recent, last_cmd, last_output);
         }
     }
 }
 
 fn handle_why_auto(
     llm: Option<&LlmState>,
+    cwd: &Path,
     recent: &[(String, i32)],
     last_cmd: &Option<String>,
     last_output: &Option<LastOutput>,
@@ -1050,7 +1207,7 @@ fn handle_why_auto(
         return;
     };
     let question = format!("Explica brevemente la salida del comando: {cmd}");
-    let ctx = build_ctx(std::path::Path::new("."), recent, last_output.as_ref());
+    let ctx = build_ctx(cwd, recent, last_output.as_ref());
     let mut spinner = Spinner::start("interpretando…");
     let result = llm.planner.as_ref().map(|p| p.explain(&question, &ctx));
     spinner.stop();
@@ -1061,6 +1218,7 @@ fn handle_why_auto(
 
 fn handle_why(
     llm: &mut LlmState,
+    cwd: &Path,
     recent: &[(String, i32)],
     last_cmd: &Option<String>,
     last_output: &Option<LastOutput>,
@@ -1070,7 +1228,7 @@ fn handle_why(
         return;
     };
     let question = format!("Explica brevemente la salida del comando: {cmd}");
-    let ctx = build_ctx(std::path::Path::new("."), recent, last_output.as_ref());
+    let ctx = build_ctx(cwd, recent, last_output.as_ref());
     let mut spinner = Spinner::start("explicando…");
     let result = llm.planner.as_ref().map(|p| p.explain(&question, &ctx));
     spinner.stop();
@@ -1164,6 +1322,21 @@ fn inject_document_context(
         let scope = current_scope(cwd);
         let canonical = policy::validate_existing_path(&abs, &scope)?;
         let policy = Broker::tool_policy(cfg, cwd, spec.connector, spec.tool)?;
+        if !policy.allows(&canonical) {
+            let roots = policy
+                .roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "{} está fuera de los roots permitidos para la tool {}.{} ({}).",
+                canonical.display(),
+                spec.connector,
+                spec.tool,
+                roots
+            );
+        }
         if !policy.allowed_schemes.iter().any(|scheme| scheme == "file") {
             bail!(
                 "connectors.{}.tools.{} no permite file:",
@@ -1261,49 +1434,110 @@ fn detect_existing_paths(line: &str, cwd: &Path) -> Vec<String> {
 
 fn build_file_sample(path: &Path) -> Result<String> {
     const MAX_BYTES: usize = 4096;
-    let bytes = std::fs::read(path).with_context(|| format!("no se pudo leer {}", path.display()))?;
-    let size = bytes.len();
-    let Ok(text) = std::str::from_utf8(&bytes) else {
+    // A partir de este tamano no se lee el fichero entero: cabeza + cola.
+    const SMALL_FILE: u64 = 64 * 1024;
+    const HEAD_BYTES: u64 = 32 * 1024;
+    const TAIL_BYTES: u64 = 8 * 1024;
+
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("no se pudo leer {}", path.display()))?;
+    if meta.file_type().is_dir() {
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for entry in rd.flatten().take(20) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                names.push(if entry.path().is_dir() {
+                    format!("{name}/")
+                } else {
+                    name
+                });
+            }
+        }
+        names.sort();
         return Ok(format!(
-            "\n--- FICHERO: {} ---\n\
+            "\n--- DIRECTORIO: {} ---\n\
+es un directorio (primeras {} entradas):\n{}\n\
+--- FIN DIRECTORIO ---\n",
+            path.display(),
+            names.len(),
+            names.join("\n")
+        ));
+    }
+
+    // Devuelve (tamano, lineas si se conocen, lineas de muestra).
+    let (size, total_lines, sample): (usize, Option<usize>, Vec<String>) =
+        if meta.len() <= SMALL_FILE {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("no se pudo leer {}", path.display()))?;
+            let size = bytes.len();
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                return Ok(format!(
+                    "\n--- FICHERO: {} ---\n\
 fichero binario, {} bytes\n\
 --- FIN FICHERO ---\n",
-            path.display(),
-            size
-        ));
+                    path.display(),
+                    size
+                ));
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let total = lines.len();
+            let mut sample = Vec::new();
+            for line in lines.iter().take(20) {
+                sample.push(truncate_line(line));
+            }
+            if total > 25 {
+                sample.push("... <corte> ...".to_string());
+            }
+            for line in lines.iter().skip(total.saturating_sub(5)) {
+                sample.push(truncate_line(line));
+            }
+            (size, Some(total), sample)
+        } else {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(path)
+                .with_context(|| format!("no se pudo leer {}", path.display()))?;
+            let mut head = vec![0u8; HEAD_BYTES as usize];
+            let n = file.read(&mut head)?;
+            head.truncate(n);
+            file.seek(SeekFrom::End(-(TAIL_BYTES.min(meta.len()) as i64)))?;
+            let mut tail = Vec::new();
+            file.read_to_end(&mut tail)?;
+            let head_text = String::from_utf8_lossy(&head);
+            let tail_text = String::from_utf8_lossy(&tail);
+            let mut sample = Vec::new();
+            for line in head_text.lines().take(20) {
+                sample.push(truncate_line(line));
+            }
+            sample.push("... <corte> ...".to_string());
+            let tail_lines: Vec<&str> = tail_text.lines().collect();
+            for line in tail_lines.iter().skip(tail_lines.len().saturating_sub(5)) {
+                sample.push(truncate_line(line));
+            }
+            (meta.len() as usize, None, sample)
+        };
+
+    let lineas = match total_lines {
+        Some(n) => n.to_string(),
+        None => "(fichero grande, muestra parcial)".to_string(),
     };
-
-    let lines: Vec<&str> = text.lines().collect();
-    let total_lines = lines.len();
-    let mut sample = Vec::new();
-    for line in lines.iter().take(20) {
-        sample.push(truncate_line(line));
-    }
-    if total_lines > 25 {
-        sample.push("... <corte> ...".to_string());
-    }
-    for line in lines.iter().skip(total_lines.saturating_sub(5)) {
-        sample.push(truncate_line(line));
-    }
-
     let mut body = format!(
         "\n--- FICHERO: {} ---\n\
 tamano: {} bytes\n\
 lineas: {}\n",
         path.display(),
         size,
-        total_lines
+        lineas
     );
     for line in sample {
         body.push_str(&line);
         body.push('\n');
         if body.len() >= MAX_BYTES {
-            body.truncate(MAX_BYTES);
+            truncate_string(&mut body, MAX_BYTES);
             break;
         }
     }
     if body.len() > MAX_BYTES {
-        body.truncate(MAX_BYTES);
+        truncate_string(&mut body, MAX_BYTES);
     }
     body.push_str("--- FIN FICHERO ---\n");
     Ok(body)
@@ -1312,7 +1546,11 @@ lineas: {}\n",
 fn truncate_line(line: &str) -> String {
     const MAX_LINE: usize = 240;
     if line.len() > MAX_LINE {
-        format!("{}...", &line[..MAX_LINE])
+        let mut end = MAX_LINE;
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &line[..end])
     } else {
         line.to_string()
     }
@@ -1359,8 +1597,36 @@ fn list_dir_entries(cwd: &Path) -> Vec<String> {
         }
     }
     entries.sort();
-    entries.truncate(200);
+    if entries.len() > 200 {
+        let remaining = entries.len() - 200;
+        entries.truncate(200);
+        entries.push(format!("… y {remaining} más"));
+    }
     entries
+}
+
+/// Escapa una ruta para interpolarla en un comando bash con doble comilla desnuda
+/// prohibida: entrecomillado simple, escapando las comillas simples que contenga.
+/// `evil"; echo INYECTADO; "` queda inerte dentro de `'...'`.
+fn shell_escape(path: &str) -> String {
+    const SEGUROS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_@%+=:,./-";
+    if !path.is_empty() && path.chars().all(|c| SEGUROS.contains(c)) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
+/// Un `@` solo inicia referencia a inicio de linea o tras un delimitador.
+/// Asi `user@example.com` (email) pasa intacto y `@fichero` se resuelve.
+fn arroba_inicia_referencia(line: &str, i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    matches!(
+        line[..i].chars().next_back(),
+        Some(c) if c.is_whitespace() || matches!(c, '"' | '\'' | '(' | '=' | ',' | ':')
+    )
 }
 
 /// Resuelve las referencias @ en una linea. Devuelve (linea_expandida, rutas_referenciadas).
@@ -1372,7 +1638,7 @@ fn resolve_at_references(line: &str, cwd: &Path) -> Result<(String, Vec<String>)
 
     while i < line.len() {
         let rest = &line[i..];
-        if rest.starts_with('@') {
+        if rest.starts_with('@') && arroba_inicia_referencia(line, i) {
             let after = &line[i + 1..];
             if after.is_empty() {
                 result.push('@');
@@ -1395,13 +1661,7 @@ fn resolve_at_references(line: &str, cwd: &Path) -> Result<(String, Vec<String>)
 
             if let Some((consumed, path_str)) = best {
                 referenced.push(path_str.clone());
-                if path_str.contains(' ') {
-                    result.push('"');
-                    result.push_str(&path_str);
-                    result.push('"');
-                } else {
-                    result.push_str(&path_str);
-                }
+                result.push_str(&shell_escape(&path_str));
                 i += 1 + consumed;
                 continue;
             }

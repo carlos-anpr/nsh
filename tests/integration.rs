@@ -544,6 +544,29 @@ fn caso_22_marcador_falso_ignorado() {
 }
 
 #[test]
+fn nonce_readonly_la_sesion_sobrevive_a_unset() {
+    let mut p = NshPty::new();
+    // NSH_NONCE es readonly: el unset falla dentro de bash pero el marcador
+    // de fin de comando sigue llegando y la sesion no se cuelga.
+    let out = p.run_cmd("unset NSH_NONCE", 10_000);
+    let text = String::from_utf8_lossy(&out);
+    // El mensaje de bash depende del locale ("readonly" / "solo lectura"):
+    // lo comprobable es que el unset falla (exit 1) y menciona NSH_NONCE.
+    assert!(
+        text.contains("NSH_NONCE") && text.contains("unset"),
+        "el unset deberia fallar por readonly: {text}"
+    );
+    assert_eq!(last_exit(&out), Some(1));
+    // La sesion sigue viva y sincronizada.
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio tras el unset"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+}
+
+#[test]
 fn caso_23_exit_cierra_limpio() {
     let mut p = NshPty::new();
     p.buf.clear();

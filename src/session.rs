@@ -17,7 +17,10 @@ stty -echo
 
 # El nonce NO se exporta: asi ningun proceso hijo puede leerlo con `printenv`
 # y falsificar un marcador de fin de comando.
+# Es readonly: si el usuario pudiera vaciarlo (`unset NSH_NONCE`), nsh esperaria
+# eternamente un marcador que nunca llegaria y la sesion quedaria colgada.
 NSH_NONCE='@@NONCE@@'
+readonly NSH_NONCE
 NSH_ID='boot'
 
 # PS0 se expande DESPUES de leer el comando y ANTES de ejecutarlo.
@@ -169,7 +172,9 @@ impl BashSession {
         };
 
         // 6. Consumir el marcador de arranque (id "boot").
-        session.drain_until("boot", false)?;
+        // Con timeout: si bash no existe o el rcfile falla, arrancar debe dar
+        // error en vez de colgarse para siempre.
+        session.drain_until("boot", false, Some(Duration::from_secs(15)))?;
         Ok(session)
     }
 
@@ -215,9 +220,12 @@ impl BashSession {
         let id = format!("c{}", self.counter);
 
         // FASE 1 — "armar": fijar NSH_ID. Dispara un marcador con el id nuevo.
-        // Confirma que la shell esta viva y sincronizada.
-        self.write_line(&format!("NSH_ID='{}'", id))?;
-        self.drain_until(&id, false)?;
+        // Confirma que la shell esta viva y sincronizada. Con timeout: si el
+        // usuario manipulo NSH_ID/NSH_NONCE (o hizo `exec` de otra shell), el
+        // marcador no llega y hay que devolver el prompt con error, no colgarse.
+        // Esta espera ocurre ANTES de entrar en raw mode: el terminal queda sano.
+        self.write_line(&format!("NSH_ID='{id}'"))?;
+        self.drain_until(&id, false, Some(Duration::from_secs(5)))?;
 
         // FASE 2 — raw mode + reenvio de teclado, ANTES de enviar el comando.
         let _raw = term::RawGuard::enter();
@@ -239,8 +247,11 @@ impl BashSession {
         // FASE 3 — enviar el comando EN CRUDO (nada de llaves).
         self.write_line(cmd)?;
 
-        // FASE 4 — drenar hasta el marcador final.
-        let result = self.drain_until(&id, true);
+        // FASE 4 — drenar hasta el marcador final. Sin timeout global: un comando
+        // legitimo puede tardar (sleep, top, vim). La desincronizacion se detecta
+        // por marcador ajeno (ver drain_until): cada comando solo puede emitir
+        // el marcador de su propio id.
+        let result = self.drain_until(&id, true, None);
 
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
@@ -251,7 +262,19 @@ impl BashSession {
 
     /// Consume eventos hasta ver Finished con `id`.
     /// Si `capture` es true, imprime la salida en vivo y la acumula.
-    fn drain_until(&mut self, id: &str, capture: bool) -> Result<Option<CommandResult>> {
+    /// `timeout` acota la espera (fases de armar/arranque). En FASE 4 es None,
+    /// pero un marcador con id ajeno delata desincronizacion (p. ej. el comando
+    /// reasigno NSH_ID) y aborta de inmediato en vez de esperar eternamente.
+    fn drain_until(
+        &mut self,
+        id: &str,
+        capture: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Option<CommandResult>> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        let stdout = std::io::stdout();
+        let start = std::time::Instant::now();
         let mut out: Vec<u8> = Vec::new();
         let mut truncated = false;
         let stdout = std::io::stdout();
@@ -289,9 +312,25 @@ impl BashSession {
                             None
                         });
                     }
-                    // Marcador de otro comando: obsoleto, se ignora.
+                    if capture {
+                        // En FASE 4 no puede llegar ningun otro marcador: el
+                        // comando reasigno NSH_ID a mitad de ejecucion y ya no
+                        // veremos el nuestro. Abortar aqui, con el terminal
+                        // restaurado por RawGuard, en vez de colgarse.
+                        bail!(
+                            "la shell se desincronizó (marcador inesperado '{fid}'; ¿el comando modificó NSH_ID?). Reinicia nsh si los comandos dejan de responder"
+                        );
+                    }
+                    // Fuera de captura (armar/arranque): marcador obsoleto, se ignora.
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    if let Some(limit) = timeout {
+                        if start.elapsed() > limit {
+                            bail!(
+                                "la shell no responde al marcador de sincronía (¿NSH_NONCE/NSH_ID manipulados? ¿`exec` de otra shell?). Reinicia nsh"
+                            );
+                        }
+                    }
                     // Momento de atender SIGWINCH mientras corre `top` o `vim`.
                     if crate::winch_pending() {
                         let (r, c) = term::window_size();

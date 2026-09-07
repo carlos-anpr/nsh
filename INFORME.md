@@ -1271,3 +1271,45 @@ End-to-end con config temporal (`NSH_CONFIG_PATH`, binario real por tubería):
 disponibles, `install` tras `remove` reactiva conservando el bloque, permisos
 `600` y `api_key` intactos.
 
+---
+
+# PASO 24 - Corrección de la auditoría (9 hallazgos)
+
+Auditoría externa sobre el árbol con los cambios del PASO 23 sin commit.
+Todos los hallazgos se corrigen en este paso; `cargo test` queda verde y
+`cargo clippy` no añade warnings nuevos (los 12 previos ya existían).
+
+## P24.1 Hallazgos y correcciones
+
+| # | Hallazgo | Corrección |
+|---|----------|------------|
+| 1 | `!unset NSH_NONCE` colgaba la sesión para siempre (drain infinito, terminal en raw mode) | `NSH_NONCE` pasa a `readonly` en el rcfile (`session.rs`); `drain_until()` acepta timeout en las fases de arranque/armado (15 s / 5 s) y en FASE 4 un marcador con id ajeno aborta de inmediato delatando desincronización, con el terminal restaurado por `RawGuard` |
+| 2 | `recortar()` / `truncate_line()` / `String::truncate()` paniquean con salida UTF-8 cortada en mitad de carácter | Corte siempre retrocediendo a límite de carácter (`is_char_boundary`): `recortar()`, `truncate_line()` y el nuevo auxiliar `truncate_string()`; tests con eñes y emoji |
+| 3 | El resolver de `@` rompía `user@example.com` | `arroba_inicia_referencia()`: un `@` solo inicia referencia a inicio de línea o tras delimitador (espacio, comilla, `(`, `=`, `,`, `:`); el email pasa intacto y `VAR=@fichero` sigue resolviendo |
+| 4 | Rutas `@` sin escapar: un fichero `evil"; echo INYECTADO; "` ejecutaba código extra | `shell_escape()` con entrecomillado simple y escapado de `'` (`'\\''`); test de inyección con el nombre malicioso |
+| 5 | Un conector MCP roto impedía arrancar toda la shell | En `main()`: si `Broker::from_config` falla, aviso por stderr y se sigue sin broker (el LLM y `!` funcionan; el pre-paso documental da error accionable) |
+| 6 | `ToolPolicyView.roots` calculado pero sin aplicar | Nuevo campo `restricted` (solo tools con roots absolutos propios restringen, política PASO 19) + `ToolPolicyView::allows()`; `inject_document_context()` rechaza con error explícito los ficheros fuera de los roots |
+| 7 | `/why` y auto-interpretación usaban `"."` en vez del cwd real de la Bash | `shell.cwd()` se propaga a `handle_why` / `handle_why_auto` / `maybe_interpret_output` |
+| 8 | `build_file_sample()` leía ficheros enteros y fallaba con directorios | `fs::metadata` primero: directorios → listado de 20 entradas; >64 KiB → cabeza 32 KiB + cola 8 KiB por `File::read` con seek (sin leer el todo); cuerpo acotado con `truncate_string` |
+| 9 | Listado truncado a 200 sin avisar | `list_dir_entries` añade línea final `… y N más` (test verifica la línea y las 200 entradas) |
+
+## P24.2 Correcciones de tests durante la verificación
+
+- `nonce_readonly_la_sesion_sobrevive_a_unset` (integración) dependía del
+  mensaje en inglés de bash (`contains("readonly")`); con bash en español el
+  mensaje es `variable es de solo lectura`. Ahora comprueba lo invariantemente
+  cierto: exit 1, mención de `NSH_NONCE` y sesión viva después.
+- `l38_fichero_binario_no_inyecta_texto` era intermitente: la ruta aleatoria
+  del `TempDir` puede contener una `A` mayúscula que aparecía en la cabecera
+  `--- FICHERO: /tmp/.tmpA... ---` y hacía fallar `!sample.contains("A")`.
+  La aserción ahora excluye la cabecera de ruta y mira solo el cuerpo.
+
+## P24.3 Salida real
+
+`cargo test` (8/8 corridas): **91 unitarios + 25 integración = 116 verdes,
+0 fallos, 6 ignored** (red/credenciales). `cargo build` y `cargo clippy`
+limpios de avisos nuevos.
+
+Permanece la limitación documentada: SIGTERM no restaura el terminal (solo se
+registra SIGWINCH); cubierta por el test `limitacion_sigterm_no_restaura_termios`.
+

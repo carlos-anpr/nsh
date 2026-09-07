@@ -43,6 +43,20 @@ pub struct ToolPolicyView {
     pub allowed_schemes: Vec<String>,
     pub max_output_bytes: usize,
     pub timeout: Duration,
+    /// true si la tool declara roots absolutos propios: entonces `allows()`
+    /// restringe de verdad. Con el valor por defecto (`roots = ["cwd"]`) es
+    /// false y no restringe, por la politica de lecturas por accion (PASO 19).
+    pub restricted: bool,
+}
+
+impl ToolPolicyView {
+    /// ¿Puede esta tool recibir el fichero ya canonicalizado?
+    pub fn allows(&self, canonical: &Path) -> bool {
+        if !self.restricted {
+            return true;
+        }
+        self.roots.iter().any(|root| canonical.starts_with(root))
+    }
 }
 
 #[allow(dead_code)]
@@ -190,11 +204,15 @@ impl Broker {
         let global_scope = Scope::new(cwd, &cfg.security.extra_roots);
         let requested = resolve_tool_roots(cwd, &tool.roots)?;
         let roots = intersect_tool_roots(&global_scope, &requested)?;
+        // Solo las tools con roots absolutos propios restringen: el "cwd" por
+        // defecto equivale a "sin restriccion adicional" (PASO 19).
+        let restricted = tool.roots.iter().any(|root| root != "cwd");
         Ok(ToolPolicyView {
             roots,
             allowed_schemes: tool.allowed_schemes.clone(),
             max_output_bytes: tool.max_output_bytes,
             timeout: Duration::from_millis(connector.timeout_ms),
+            restricted,
         })
     }
 }
@@ -538,6 +556,79 @@ mod tests {
             .roots = vec![outside.canonicalize().unwrap().display().to_string()];
         let err = Broker::tool_policy(&cfg, &cwd, "markitdown", "convert_to_markdown").unwrap_err();
         assert!(format!("{err}").contains("amplía el perímetro global"));
+    }
+
+    #[test]
+    fn tool_policy_restringe_solo_con_roots_absolutos() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("cwd");
+        let docs = tmp.path().join("docs");
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        // El root absoluto debe existir y estar dentro del perimetro global:
+        // se añade como extra_root.
+        let mut cfg = cfg();
+        cfg.security.extra_roots = vec![docs.canonicalize().unwrap(), other.canonicalize().unwrap()];
+
+        // Por defecto (roots = ["cwd"]): sin restriccion (politica PASO 19).
+        let mut cfg_default = cfg.clone();
+        cfg_default.connectors.insert(
+            "markitdown".into(),
+            ConnectorConfig {
+                enabled: true,
+                command: "uvx".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+                working_dir: ConnectorWorkingDir::Cwd,
+                timeout_ms: 30_000,
+                tools: BTreeMap::from([(
+                    "convert_to_markdown".into(),
+                    ConnectorToolConfig {
+                        effect: ConnectorToolEffect::ReadLocal,
+                        approval: ConnectorApproval::AutoForReferenced,
+                        roots: vec!["cwd".into()],
+                        allowed_schemes: vec!["file".into()],
+                        max_output_bytes: 1024,
+                    },
+                )]),
+            },
+        );
+        let policy = Broker::tool_policy(&cfg_default, &cwd, "markitdown", "convert_to_markdown")
+            .unwrap();
+        assert!(!policy.restricted);
+        assert!(policy.allows(&other.canonicalize().unwrap().join("x.pdf")));
+
+        // Con root absoluto propio: restringe de verdad.
+        let mut cfg_pinned = cfg.clone();
+        cfg_pinned.connectors.insert(
+            "markitdown".into(),
+            ConnectorConfig {
+                enabled: true,
+                command: "uvx".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+                working_dir: ConnectorWorkingDir::Cwd,
+                timeout_ms: 30_000,
+                tools: BTreeMap::from([(
+                    "convert_to_markdown".into(),
+                    ConnectorToolConfig {
+                        effect: ConnectorToolEffect::ReadLocal,
+                        approval: ConnectorApproval::AutoForReferenced,
+                        roots: vec![docs.canonicalize().unwrap().display().to_string()],
+                        allowed_schemes: vec!["file".into()],
+                        max_output_bytes: 1024,
+                    },
+                )]),
+            },
+        );
+        let policy = Broker::tool_policy(&cfg_pinned, &cwd, "markitdown", "convert_to_markdown")
+            .unwrap();
+        assert!(policy.restricted);
+        assert!(policy.allows(&docs.canonicalize().unwrap().join("informe.pdf")));
+        assert!(!policy.allows(&other.canonicalize().unwrap().join("otro.pdf")));
+        assert!(!policy.allows(&cwd.canonicalize().unwrap().join("nota.pdf")));
     }
 
     #[test]
