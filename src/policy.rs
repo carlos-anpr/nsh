@@ -140,7 +140,7 @@ pub fn analyze_command(cmd: &str, scope: &Scope) -> CommandAnalysis {
     }
 
     for target in &redirection_targets {
-        if is_system_zone(target) {
+        if is_writable_system_zone(target) {
             return CommandAnalysis::deny("escritura o borrado en zona de sistema".into(), false);
         }
         analysis.set_confirm_once("puede modificar cosas");
@@ -545,7 +545,7 @@ fn split_segments(cmd: &str, scope: &Scope) -> Vec<SegmentAnalysis> {
                         }
                     }
                     "mv" | "cp" | "tee" | "mkdir" | "touch" => {
-                        if system_zone {
+                        if is_writable_system_zone(&path) {
                             analysis.writes_system_zone = true;
                         } else {
                             analysis.normal_write = true;
@@ -688,6 +688,31 @@ fn is_system_zone(path: &Path) -> bool {
     SYSTEM_ZONES.iter().any(|zone| path.starts_with(zone))
 }
 
+/// Sumideros inofensivos de /dev: `cmd 2>/dev/null`, `> /dev/null`,
+/// `tee /dev/stderr`... no tocan nada del sistema. Un `rm` a estos ficheros
+/// SI es destructivo (borrar /dev/null rompe el sistema): la excepcion solo
+/// vale para escrituras, no para borrados.
+fn is_harmless_dev_sink(path: &Path) -> bool {
+    let mut comps = path.components();
+    matches!(comps.next(), Some(Component::RootDir))
+        && matches!(comps.next(), Some(Component::Normal(seg)) if seg == "dev")
+        && matches!(
+            comps.next(),
+            Some(Component::Normal(seg))
+                if matches!(
+                    seg.to_str(),
+                    Some("null" | "stdout" | "stderr" | "tty" | "zero" | "full")
+                )
+        )
+        && comps.next().is_none()
+}
+
+/// Escritura en zona de sistema: como is_system_zone pero perdonando los
+/// sumideros inofensivos de /dev.
+fn is_writable_system_zone(path: &Path) -> bool {
+    is_system_zone(path) && !is_harmless_dev_sink(path)
+}
+
 fn find_root_candidate(tokens: &[String], cwd: &Path) -> Option<PathBuf> {
     tokens
         .iter()
@@ -778,6 +803,41 @@ mod tests {
             let d_yolo = evaluate_with_mode(&cmd(c, Effect::ReadOnly), &scope(tmp.path()), true);
             assert!(matches!(d_yolo, Decision::Confirm(_)), "{c}: {d_yolo:?}");
         }
+    }
+
+    #[test]
+    fn redirigir_a_dev_null_no_es_zona_de_sistema() {
+        let tmp = TempDir::new().unwrap();
+        // El caso real del usuario: un find con stderr silenciado no es una
+        // escritura en zona de sistema.
+        for c in [
+            "find . -name 'x' 2>/dev/null | wc -l",
+            "echo hola > /dev/null",
+            "echo hola >> /dev/null",
+            "echo hola 2>/dev/null",
+            "ls noexiste &>/dev/null",
+            "tee /dev/null < nota.txt",
+            "cmd 2>/dev/null",
+        ] {
+            let d = evaluate(&cmd(c, Effect::ReadOnly), &scope(tmp.path()));
+            assert!(
+                !matches!(d, Decision::Deny(_)),
+                "{c}: no deberia ser Deny: {d:?}"
+            );
+        }
+        // Pero las escrituras al resto de /dev y a zonas de sistema siguen
+        // en Deny.
+        for c in [
+            "echo x > /dev/sda",
+            "echo x > /etc/passwd",
+            "tee /etc/hosts < nota.txt",
+        ] {
+            let d = evaluate(&cmd(c, Effect::ReadOnly), &scope(tmp.path()));
+            assert!(matches!(d, Decision::Deny(_)), "{c}: {d:?}");
+        }
+        // Y BORRAR un sumidero si es destructivo: rm /dev/null sigue en Deny.
+        let d = evaluate(&cmd("rm /dev/null", Effect::Destructive), &scope(tmp.path()));
+        assert!(matches!(d, Decision::Deny(_)), "{d:?}");
     }
 
     #[test]
