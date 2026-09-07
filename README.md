@@ -50,6 +50,38 @@ nsh ~ ❯ /plugins install documentos
 - Añadir un plugin futuro es añadir una entrada al catálogo en `src/plugins.rs`;
   la detección por extensión (`is_document_reference`) ya tira del catálogo
 
+## 19 - Modo de aprobación: `confirm` (defecto) y `yolo`
+
+Por defecto (`approval = "confirm"`), todo lo que no es lectura pura pide
+confirmación (`[e]jecutar [c]ancelar [m]odificar`).
+
+Para una experiencia fluida, `~/.config/nsh/config.toml`:
+
+```toml
+[security]
+approval = "yolo"
+```
+
+o en caliente, dentro de nsh: `/yolo` (toggle; `/yolo on` / `/yolo off`).
+
+En `yolo` se ejecuta sin preguntar **todo** excepto lo peligroso de verdad:
+
+| Situación | `confirm` | `yolo` |
+|---|---|---|
+| Lecturas, búsquedas, tuberías de lectura | ejecuta | ejecuta |
+| Escribir/borrar ficheros y directorios normales, redirecciones, `tee`, globs | confirma | **ejecuta** |
+| `chmod 777`, mutación del sistema (paquetes, servicios...), borrado masivo (`find -delete`) | confirma | **confirma** |
+| Zonas de sistema (`/etc`, `/usr`...), escalada de privilegios, `mkfs`, `rm -rf /`, `curl ... | sh` | **deniega** | **deniega** |
+
+## 20 - Salida limpia
+
+El resultado de un comando se muestra tal cual, como en una terminal normal:
+
+- Éxito: **silencio** (no hay `[terminado: 0]`).
+- Fallo: una línea `[terminado: N]` con el código exacto.
+- El aviso `· /why para interpretar la salida` ya no se imprime; si lo quieres
+  automático, `interpret_output = "auto"` en el config.
+
 ## 14 - Scope de rutas y secretos
 
 La politica original por rutas se ha revertido en el PASO 19 por decision explicita del usuario. El criterio actual es por tipo de accion, no por ubicacion.
@@ -58,6 +90,11 @@ La politica original por rutas se ha revertido en el PASO 19 por decision explic
 - `cat ~/.ssh/id_rsa` vuelve a ser `Allow`
 - Las rutas sensibles ya no bloquean la ejecucion; solo disparan la omision opcional de `last_output`
 - `redact_sensitive_output = true|false` en `[security]` controla esa omision; por defecto `true`
+- Las muestras automáticas de contexto omiten siempre el contenido de rutas
+  sensibles, comprobando también el destino de enlaces simbólicos. El LLM recibe
+  un aviso de omisión; esto no impide leer el fichero localmente con `!`.
+- `sort` con opciones de salida (`-o`, `--output` y variantes) requiere
+  confirmación aunque el LLM lo clasifique como lectura.
 - Lo que sigue prohibido o confirmado se decide por accion: borrado masivo, escritura en zonas de sistema, descarga y ejecucion, escalada de privilegios, mutaciones del sistema, etc.
 
 ### Limites conocidos

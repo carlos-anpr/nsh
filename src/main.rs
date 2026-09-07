@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use config::Config;
+use config::{ApprovalMode, Config};
 use llm::anthropic::AnthropicClient;
 use llm::openai::OpenAiClient;
 use llm::{PlanOutcome, PlannedCommand, Planner, ShellContext};
@@ -125,6 +125,11 @@ fn main() -> Result<()> {
     }
     let mut shell = session::BashSession::start(load_bashrc)?;
     let mut llm_state = LlmState::load();
+    let mut approval = llm_state
+        .config
+        .as_ref()
+        .map(|c| c.security.approval)
+        .unwrap_or_default();
     // Un conector MCP opcional roto (binario inexistente, timeout, ...) no puede
     // impedir arrancar la shell: se avisa y se sigue sin broker. El pre-paso
     // documental ya da error accionable (/plugins install ...) en ese caso.
@@ -219,12 +224,33 @@ fn main() -> Result<()> {
             );
             continue;
         }
+        if line == "/yolo" || line == "/yolo on" || line == "/yolo off" {
+            approval = match line {
+                "/yolo on" => ApprovalMode::Yolo,
+                "/yolo off" => ApprovalMode::Confirm,
+                _ => {
+                    // Toggle: yolo <-> confirm
+                    if approval == ApprovalMode::Yolo {
+                        ApprovalMode::Confirm
+                    } else {
+                        ApprovalMode::Yolo
+                    }
+                }
+            };
+            match approval {
+                ApprovalMode::Yolo => println!(
+                    "  ✓ modo yolo: los comandos del LLM se ejecutan sin preguntar.\n    Siguen pidiendo confirmacion: chmod 777, mutaciones del sistema,\n    borrado masivo. Y siguen prohibidos: zonas de sistema, escalada de\n    privilegios, descarga+ejecucion (Deny)."
+                ),
+                ApprovalMode::Confirm => println!("  ✓ modo confirm: se pide confirmacion en todo lo que no sea lectura"),
+            }
+            continue;
+        }
         if line == "/plugins" || line.starts_with("/plugins ") {
             handle_plugins(line, &mut llm_state, &mut mcp_broker, shell.cwd());
             continue;
         }
         if line.starts_with('/') {
-            eprintln!("comando desconocido: {line} (disponibles: /models /model /fix /why /plugins /exit)");
+            eprintln!("comando desconocido: {line} (disponibles: /models /model /fix /why /plugins /yolo /exit)");
             continue;
         }
 
@@ -276,6 +302,7 @@ fn main() -> Result<()> {
         handle_natural(
             line,
             &mut llm_state,
+            approval,
             mcp_broker.as_ref(),
             &mut shell,
             &mut editor,
@@ -820,6 +847,39 @@ mod tests {
     }
 
     #[test]
+    fn context_omits_sensitive_files_and_symlinks_before_reading() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".env"), "FAKE_SECRET_FOR_TEST").unwrap();
+        fs::write(tmp.path().join("public.txt"), "PUBLIC_SAMPLE").unwrap();
+        symlink(tmp.path().join(".env"), tmp.path().join("innocent.txt")).unwrap();
+        symlink(tmp.path().join("public.txt"), tmp.path().join("private.key")).unwrap();
+        // La omisión aplica al contexto previo al LLM, también sin configuración.
+        for name in [".env", "innocent.txt", "private.key"] {
+            let result = inject_document_context(None, None, tmp.path(), &format!("analiza {name}"), &[]).unwrap();
+            let ContextInjection::FileSample(text) = result else { panic!("esperaba marcador de omisión") };
+            assert!(text.contains("contenido omitido: fichero sensible"));
+            assert!(!text.contains("FAKE_SECRET_FOR_TEST"));
+            assert!(!text.contains("PUBLIC_SAMPLE"));
+        }
+    }
+
+    #[test]
+    fn file_samples_do_not_duplicate_overlapping_head_and_tail() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("events.log");
+        for count in [0usize, 1, 3, 5, 19, 20, 21, 24, 25, 26, 30] {
+            let events: Vec<String> = (0..count).map(|n| format!("EVENT_{n:03}")).collect();
+            fs::write(&file, events.join("\n")).unwrap();
+            let sample = build_file_sample(&file).unwrap();
+            for (index, event) in events.iter().enumerate() {
+                let expected = usize::from(index < 20 || index >= count.saturating_sub(5));
+                assert_eq!(sample.lines().filter(|line| *line == event).count(), expected, "count={count}, event={event}");
+            }
+        }
+    }
+
+    #[test]
     fn muestra_de_dispositivo_no_bloquea() {
         // /dev/null es un dispositivo de caracteres: no es fichero regular.
         let sample = build_file_sample(Path::new("/dev/null")).unwrap();
@@ -948,7 +1008,11 @@ fn run_command(
         .unwrap_or(true);
     match shell.execute(cmd) {
         Ok(r) => {
-            println!("[terminado: {}]", r.exit_code);
+            // Exitos en silencio, como una terminal normal; solo el fallo
+            // merece una linea (y el usuario puede ver el codigo exacto).
+            if r.exit_code != 0 {
+                println!("[terminado: {}]", r.exit_code);
+            }
             if r.truncated {
                 println!("[salida truncada: solo se guardaron los ultimos 256 KiB]");
             }
@@ -1004,6 +1068,7 @@ fn truncate_string(s: &mut String, max: usize) {
 fn handle_natural(
     request: &str,
     llm: &mut LlmState,
+    approval: ApprovalMode,
     broker: Option<&Broker>,
     shell: &mut session::BashSession,
     editor: &mut Editor<NshHelper, DefaultHistory>,
@@ -1055,7 +1120,9 @@ fn handle_natural(
             };
             match planned {
                 PlanOutcome::Command(planned) => {
-                    present_and_run(planned, shell, editor, last_cmd, last_output, recent, llm)
+                    present_and_run(
+                        planned, shell, editor, last_cmd, last_output, recent, llm, approval,
+                    )
                 }
                 PlanOutcome::DirectText(text) => println!("\n{text}"),
             }
@@ -1064,6 +1131,7 @@ fn handle_natural(
 }
 
 /// Muestra explicación+comando, aplica la política y ofrece [e/c/m].
+#[allow(clippy::too_many_arguments)]
 fn present_and_run(
     mut planned: PlannedCommand,
     shell: &mut session::BashSession,
@@ -1072,13 +1140,18 @@ fn present_and_run(
     last_output: &mut Option<LastOutput>,
     recent: &mut Vec<(String, i32)>,
     llm: &LlmState,
+    approval: ApprovalMode,
 ) {
     println!();
     println!("  {}", planned.explanation);
     println!("  $ {}", planned.command);
     println!();
 
-    let decision = policy::evaluate(&planned, &current_scope(shell.cwd()));
+    let decision = policy::evaluate_with_mode(
+        &planned,
+        &current_scope(shell.cwd()),
+        approval == ApprovalMode::Yolo,
+    );
     match decision {
         policy::Decision::Deny(reason) => {
             eprintln!("  ✗ rechazado: {reason}");
@@ -1215,7 +1288,20 @@ fn handle_fix(
             return;
         }
     };
-    present_and_run(planned, shell, editor, last_cmd, last_output, recent, llm);
+    present_and_run(
+        planned,
+        shell,
+        editor,
+        last_cmd,
+        last_output,
+        recent,
+        llm,
+        // /fix se usa a peticion explicita del usuario: se respeta el modo.
+        llm.config
+            .as_ref()
+            .map(|c| c.security.approval)
+            .unwrap_or_default(),
+    );
 }
 
 fn maybe_interpret_output(
@@ -1337,6 +1423,13 @@ fn inject_document_context(
     for referenced_path in &all_refs {
         let abs = resolve_referenced_abs_path(cwd, referenced_path)?;
         if !abs.exists() {
+            continue;
+        }
+        if policy::sensitive_context_path(&abs)? {
+            file_samples.push(format!(
+                "\n--- FICHERO: {} ---\n[contenido omitido: fichero sensible]\n--- FIN FICHERO ---\n",
+                abs.display()
+            ));
             continue;
         }
         if !is_document_reference(&abs) {
@@ -1547,7 +1640,7 @@ fichero binario, {} bytes\n\
             if total > 25 {
                 sample.push("... <corte> ...".to_string());
             }
-            for line in lines.iter().skip(total.saturating_sub(5)) {
+            for line in lines.iter().skip(20.max(total.saturating_sub(5))) {
                 sample.push(truncate_line(line));
             }
             (size, Some(total), sample)

@@ -19,6 +19,20 @@ pub struct Provider {
     pub reasoning_effort: Option<String>,
 }
 
+/// Cuanto pide nsh antes de ejecutar un comando planeado por el LLM.
+///
+/// - `confirm` (defecto): todo lo que no sea lectura pide confirmacion.
+/// - `yolo`: ejecuta sin preguntar salvo lo peligroso de verdad (zonas de
+///   sistema, escalada de privilegios, chmod 777, mutaciones del sistema y
+///   borrado masivo siguen en Confirm; la lista de prohibidos sigue en Deny).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    #[default]
+    Confirm,
+    Yolo,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
     #[serde(default = "default_security_roots")]
@@ -27,14 +41,16 @@ pub struct SecurityConfig {
     pub extra_roots: Vec<PathBuf>,
     #[serde(default = "default_redact_sensitive_output")]
     pub redact_sensitive_output: bool,
+    #[serde(default)]
+    pub approval: ApprovalMode,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum InterpretOutputMode {
-    #[default]
     Hint,
     Auto,
+    #[default]
     Never,
 }
 
@@ -140,6 +156,7 @@ impl Default for SecurityConfig {
             roots: default_security_roots(),
             extra_roots: Vec::new(),
             redact_sensitive_output: default_redact_sensitive_output(),
+            approval: ApprovalMode::Confirm,
         }
     }
 }
@@ -354,6 +371,29 @@ api = "anthropic"
 api_key = "una-key"
 models = ["glm-5.2", "glm-4.7"]
 "#;
+
+    #[test]
+    fn approval_yolo_se_parsea() {
+        let toml = r#"
+model = "p/m"
+
+[security]
+approval = "yolo"
+
+[providers.p]
+base_url = "http://x"
+api = "anthropic"
+api_key = "k"
+models = ["m"]
+"#;
+        let (_g, path) = write_tmp(toml, 0o600);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.security.approval, ApprovalMode::Yolo);
+        // El defecto sigue siendo confirm.
+        let (_g2, path2) = write_tmp(OK_TOML, 0o600);
+        let cfg2 = Config::load_from(&path2).unwrap();
+        assert_eq!(cfg2.security.approval, ApprovalMode::Confirm);
+    }
 
     #[test]
     fn resolve_bien() {

@@ -1418,3 +1418,46 @@ un efecto colateral de un comando legitimo como `printf(){ :; }`). Sombrear
 el caso extremo, el siguiente comando detecta la ausencia de marcador por el
 timeout de FASE 1 (5 s) y cierra nsh limpio en vez de colgarse. No se protege
 más el arnés para no obsurecer el rcfile.
+
+---
+
+# PASO 27 - Modo yolo y salida limpia
+
+Peticion del usuario: la aplicacion debia sentirse tan fluida como la propia
+terminal. Dos quejas: confirmacion constante para cosas triviales, y ruido
+permanente (`[terminado: 0]`, aviso de `/why`) tapando el resultado.
+
+## P27.1 Modo yolo
+
+- `config.toml`: `[security] approval = "confirm"|"yolo"` (defecto `confirm`).
+  Toggle en caliente: `/yolo` (on/off) en el REPL; `/fix` respeta el modo del
+  config.
+- `policy::evaluate_with_mode(p, scope, yolo)`: en yolo, los `Confirm` por
+  escrituras normales, globs/expansiones, estructuras no analizables, tuberias
+  no-lectura y el `Modifies`/`Destructive` del modelo pasan a `Allow`.
+- Lo peligroso de verdad mantiene su frena:
+  - `Deny` intacto siempre: zonas de sistema, escalada de privilegios,
+    lista de prohibidos, descarga+ejecucion, borrado masivo fuera del root.
+  - Nuevo campo `CommandAnalysis.dangerous`: `chmod 777`, mutacion del
+    sistema y borrado masivo dentro del root siguen en `Confirm` incluso en
+    yolo.
+- Tests: `yolo_permite_escrituras_normales`, `yolo_permite_globs_y_tuberias_no_lectura`,
+  `yolo_sigue_pidiendo_lo_peligroso`, `yolo_no_toqua_el_deny`,
+  `approval_yolo_se_parsea`.
+
+## P27.2 Salida limpia
+
+- `[terminado: N]` solo se imprime en FALLO; el exito es silencio, como una
+  terminal normal.
+- `InterpretOutputMode` por defecto pasa de `hint` a `never`: se acabó el
+  `· /why para interpretar la salida` tras cada comando (opt-in con
+  `interpret_output = "auto"`).
+- El arnes de integracion se adapta: `run_cmd` espera el prompt (`❯`) en vez
+  del marcador de terminado, y `assert_exit_ok` verifica el exito por
+  ausencia de `[terminado:`; caso_22 y marcador_valido_falso ajustan su
+  asercion discriminante (el falso aceptado habria impreso su terminado).
+
+## P27.3 Salida real
+
+`cargo test`: **109 unitarios + 34 integracion, 0 fallos, 6 ignored**.
+`cargo clippy`: 9 avisos de estilo (sin cambios).

@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
+/// El glifo ❯ del prompt de nsh: señal de que la shell volvió del comando.
+const PROMPT_BYTES: &[u8] = b"\xe2\x9d\xaf";
 
 /// Driver de la sesión de nsh dentro de una PTY.
 struct NshPty {
@@ -194,12 +196,13 @@ impl NshPty {
         self.writer.flush().expect("flush");
     }
 
-    /// Ejecuta `!cmd`, espera a `[terminado: N]` y al siguiente prompt, y
-    /// devuelve una instantánea del búfer acumulado.
+    /// Ejecuta `!cmd`, espera al siguiente prompt (el éxito es silencioso;
+    /// solo los fallos imprimen `[terminado: N]`) y devuelve una instantánea
+    /// del búfer acumulado.
     fn run_cmd(&mut self, cmd: &str, timeout_ms: u64) -> Vec<u8> {
         self.buf.clear();
         self.send_line(&format!("!{cmd}"));
-        self.read_until(b"[terminado:", timeout_ms, &format!("cmd: !{cmd}"));
+        self.read_until(PROMPT_BYTES, timeout_ms, &format!("cmd: !{cmd}"));
         // captura el `N]`, el `\n` y el siguiente prompt
         self.drain(400);
         let snap = self.buf.clone();
@@ -219,6 +222,17 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// El comando debía terminar bien: en modo silencioso NO se imprime
+/// `[terminado: 0]`, así que éxito == sin marcador de terminado.
+fn assert_exit_ok(b: &[u8]) {
+    assert_eq!(
+        last_exit(b),
+        None,
+        "el comando debia salir 0 y se imprimio [terminado: N]: {}",
+        String::from_utf8_lossy(b)
+    );
 }
 
 /// Último `[terminado: N]` del búfer.
@@ -282,7 +296,7 @@ fn last_prompt_cwd(b: &[u8]) -> Option<String> {
 fn prefijo_incompleto_no_pierde_fin_real() {
     let mut p = NshPty::new();
     let out = p.run_cmd("builtin printf '\\033]777;nsh;basura-sin-bel'", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     assert_eq!(last_exit(&p.run_cmd("false", 5000)), Some(1));
 }
 
@@ -296,14 +310,14 @@ fn marcador_valido_falso_no_adelanta_finalizacion() {
     p.drain(200);
     assert_eq!(last_exit(&p.snapshot()), Some(1));
     assert!(String::from_utf8_lossy(&p.snapshot()).contains("SALIDA_REAL"));
-    assert_eq!(last_exit(&p.run_cmd("echo SIGUIENTE", 5000)), Some(0));
+    assert_exit_ok(&p.run_cmd("echo SIGUIENTE", 5000));
 }
 
 #[test]
 fn caso_01_pwd() {
     let mut p = NshPty::new();
     let out = p.run_cmd("pwd", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     // pwd imprime una ruta absoluta (arrancamos en /tmp).
     let visible = String::from_utf8_lossy(&out);
     let line = visible
@@ -323,7 +337,7 @@ fn caso_02_cd_persiste_sobre_prompt() {
     let mut p = NshPty::new();
     // 1. cd /tmp
     let out_cd = p.run_cmd("cd /tmp", 5000);
-    assert_eq!(last_exit(&out_cd), Some(0));
+    assert_exit_ok(&out_cd);
     // 2. el ÚLTIMO prompt visible debe ser /tmp
     let prompt_cwd = last_prompt_cwd(&out_cd).expect("no se vio prompt tras cd");
     assert_eq!(
@@ -333,7 +347,7 @@ fn caso_02_cd_persiste_sobre_prompt() {
     );
     // 3. doble confirmación con pwd
     let out_pwd = p.run_cmd("pwd", 5000);
-    assert_eq!(last_exit(&out_pwd), Some(0));
+    assert_exit_ok(&out_pwd);
     assert!(
         find_sub(&out_pwd, b"/tmp").is_some(),
         "pwd no devolvio /tmp: {}",
@@ -346,7 +360,7 @@ fn caso_03_export_persiste() {
     let mut p = NshPty::new();
     let _ = p.run_cmd("export M=hola", 5000);
     let out = p.run_cmd("printf '%s\\n' \"$M\"", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     assert!(
         find_sub(&out, b"hola").is_some(),
         "esperaba 'hola': {}",
@@ -359,7 +373,7 @@ fn caso_04_alias_persiste() {
     let mut p = NshPty::new();
     let _ = p.run_cmd("alias la='ls -la'", 5000);
     let out = p.run_cmd("la", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     // `ls -la` lista siempre al menos `total ` o entradas `drw`
     assert!(
         find_sub(&out, b"total").is_some() || find_sub(&out, b"drw").is_some(),
@@ -384,7 +398,7 @@ fn caso_05_exitcode_y_stderr() {
 fn caso_06_sin_salto_final() {
     let mut p = NshPty::new();
     let out = p.run_cmd("printf 'sin salto final'", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     assert!(
         find_sub(&out, b"sin salto final").is_some(),
         "esperaba el texto exacto: {}",
@@ -396,7 +410,7 @@ fn caso_06_sin_salto_final() {
 fn caso_07_color_ansi() {
     let mut p = NshPty::new();
     let out = p.run_cmd("printf '\\033[31mrojo\\033[0m\\n'", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     let expected = b"\x1b[31mrojo\x1b[0m";
     assert!(
         find_sub(&out, expected).is_some(),
@@ -409,7 +423,7 @@ fn caso_07_color_ansi() {
 fn caso_08_salida_masiva_y_truncada() {
     let mut p = NshPty::new();
     let out = p.run_cmd("seq 1 100000", 15_000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     assert!(
         find_sub(&out, b"[salida truncada:").is_some(),
         "esperaba el aviso de truncado: {}",
@@ -440,7 +454,7 @@ fn caso_10_ruta_con_espacios() {
     let mut p = NshPty::new();
     let quoted = format!("cd '{}'", dir.to_str().unwrap());
     let out = p.run_cmd(&quoted, 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     let prompt_cwd = last_prompt_cwd(&out).expect("no prompt");
     assert!(
         prompt_cwd.contains("dir con espacios nsh"),
@@ -455,7 +469,7 @@ fn caso_12_tput_cols() {
     // El PTY del test está fijado a 120 columnas.
     let mut p = NshPty::new();
     let out = p.run_cmd("tput cols", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     assert!(
         find_sub(&out, b"120").is_some(),
         "tput cols no devolvio 120: {}",
@@ -467,7 +481,7 @@ fn caso_12_tput_cols() {
 fn caso_14_background_ampersand() {
     let mut p = NshPty::new();
     let out = p.run_cmd("sleep 1 &", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     assert!(
         find_sub(&out, b"[1]").is_some(),
         "esperaba el spec de job [1]: {}",
@@ -481,7 +495,7 @@ fn caso_14_background_ampersand() {
 fn caso_15_comentario_final() {
     let mut p = NshPty::new();
     let out = p.run_cmd("ls /tmp # comentario final", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
 }
 
 #[test]
@@ -494,7 +508,7 @@ fn caso_16_comilla_sin_cerrar_sigue_vivo() {
     p.drain(400);
     // prueba de que la sesión sigue viva: un comando normal debe funcionar
     let out = p.run_cmd("echo todavia_vivo", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     assert!(
         find_sub(&out, b"todavia_vivo").is_some(),
         "la sesión no seguía viva: {}",
@@ -523,17 +537,17 @@ fn caso_20_ctrl_c_durante_sleep() {
     );
     // la sesión sigue: comando siguiente funciona
     let out2 = p.run_cmd("echo tras_ctrlc", 5000);
-    assert_eq!(last_exit(&out2), Some(0));
+    assert_exit_ok(&out2);
 }
 
 #[test]
 fn caso_21_binario_sin_panic() {
     let mut p = NshPty::new();
     let out = p.run_cmd("head -c 200 /dev/urandom", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     // nsh no debe haber caído: la siguiente orden funciona
     let out2 = p.run_cmd("echo vivo", 5000);
-    assert_eq!(last_exit(&out2), Some(0));
+    assert_exit_ok(&out2);
 }
 
 #[test]
@@ -545,17 +559,19 @@ fn caso_22_marcador_falso_ignorado() {
     // El marcador falsificado (nonce FALSO). printf lo imprime literalmente
     // como bytes; el parser de nsh debe verlo, comprobar el nonce, descartarlo.
     let out = p.run_cmd("printf '\\033]777;nsh;FALSO;x;0;Lw==\\007'", 5000);
-    assert_eq!(last_exit(&out), Some(0));
-    // exactamente UN [terminado] (el del comando real), el falsificado no cuenta
+    assert_exit_ok(&out);
+    // El exito ahora es silencioso: si el marcador falsificado hubiera sido
+    // aceptado, nsh habria impreso [terminado: 0] (el exit que declara el
+    // falso) y el conteo seria 1. Ignorado => 0.
     assert_eq!(
         count_terminado(&out),
-        1,
+        0,
         "el marcador falso NO fue ignorado: {}",
         String::from_utf8_lossy(&out)
     );
     // estado inalterado: pwd sigue dando lo mismo
     let out2 = p.run_cmd("pwd", 5000);
-    assert_eq!(last_exit(&out2), Some(0));
+    assert_exit_ok(&out2);
     let cwd_after = last_prompt_cwd(&out2);
     assert_eq!(
         cwd_before, cwd_after,
@@ -583,7 +599,7 @@ fn nonce_readonly_la_sesion_sobrevive_a_unset() {
         String::from_utf8_lossy(&out).contains("VIVO"),
         "la sesion no respondio tras el unset"
     );
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
 }
 
 #[test]
@@ -718,7 +734,7 @@ fn hook_interno_readonly_la_sesion_sobrevive() {
         String::from_utf8_lossy(&out).contains("VIVO"),
         "la sesion no respondio tras el unset de PROMPT_COMMAND"
     );
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
 }
 
 /// El hook usa `builtin printf` y `command -p stty/base64`: una función del
@@ -730,13 +746,13 @@ fn hook_sobrevive_a_sombra_de_printf() {
     // Antes del endurecimiento, ESTE comando ya no recibia marcador: el hook
     // llamaba al printf sombreado y run_cmd agotaba su timeout.
     let out = p.run_cmd("printf(){ :; }", 10_000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     let out = p.run_cmd("echo VIVO", 10_000);
     assert!(
         String::from_utf8_lossy(&out).contains("VIVO"),
         "la sesion no respondio tras sombrear printf"
     );
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
 }
 
 /// `command -p` busca stty/base64 en el PATH por defecto del sistema: un PATH
@@ -745,13 +761,13 @@ fn hook_sobrevive_a_sombra_de_printf() {
 fn hook_sobrevive_a_path_inutilizado() {
     let mut p = NshPty::new();
     let out = p.run_cmd("PATH=/no/existe", 10_000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     let out = p.run_cmd("echo VIVO", 10_000);
     assert!(
         String::from_utf8_lossy(&out).contains("VIVO"),
         "la sesion no respondio con PATH roto"
     );
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     // Restablecer para no dejar la sesión coja.
     let _ = p.run_cmd("PATH=$PATH", 10_000);
 }
@@ -764,14 +780,14 @@ fn hook_sobrevive_a_path_inutilizado() {
 fn pwd_artificial_gigante_no_rompe_el_marcador() {
     let mut p = NshPty::new();
     let out = p.run_cmd("PWD=$(printf 'a%.0s' {1..20000})", 10_000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     // El marcador llegó (run_cmd no agotó timeout) y la sesión sigue viva.
     let out = p.run_cmd("echo VIVO", 10_000);
     assert!(
         String::from_utf8_lossy(&out).contains("VIVO"),
         "la sesion no respondio tras el PWD gigante"
     );
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     let _ = p.run_cmd("cd /tmp", 10_000);
 }
 
@@ -835,11 +851,8 @@ fn cwd_profundo_el_marcador_no_se_descarta() {
     let mut p = NshPty::new_with_cwd(dir.clone());
     let out = p.run_cmd("echo ENCONTRADO", 10_000);
     let text = String::from_utf8_lossy(&out);
-    assert_eq!(
-        last_exit(&out),
-        Some(0),
-        "el comando fallo en cwd profundo: {text}"
-    );
+    assert_exit_ok(&out); // "el comando fallo en cwd profundo: {text}"
+
     assert!(text.contains("ENCONTRADO"));
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -860,7 +873,7 @@ fn l9_sin_config_degradacion_honrada() {
     p.buf.clear();
     // `!` sigue funcionando.
     let out = p.run_cmd("echo ok_l9", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     assert!(
         find_sub(&out, b"ok_l9").is_some(),
         "`!` no funcionó sin config: {}",
@@ -876,7 +889,7 @@ fn l9_sin_config_degradacion_honrada() {
     );
     // y la sesión sigue viva: un !echo más funciona.
     let out2 = p.run_cmd("echo sigue_vivo", 5000);
-    assert_eq!(last_exit(&out2), Some(0));
+    assert_exit_ok(&out2);
 }
 
 // ---------- FASE 3: Referencias a ficheros (PASO 12) ----------
@@ -897,7 +910,7 @@ fn f6_resolucion_arroba_en_modo_exclamacion() {
 
     let mut p = NshPty::new_with_cwd(tmp_path.clone());
     let out = p.run_cmd("wc -l @src/main.rs", 5000);
-    assert_eq!(last_exit(&out), Some(0));
+    assert_exit_ok(&out);
     // Debe mostrar la ruta expandida (src/main.rs) en la salida
     assert!(
         find_sub(&out, b"src/main.rs").is_some(),
@@ -950,7 +963,7 @@ models = ["glm-4.7"]
     );
     // La sesión sigue viva
     let out2 = p.run_cmd("echo sigue_vivo", 5000);
-    assert_eq!(last_exit(&out2), Some(0));
+    assert_exit_ok(&out2);
 }
 
 #[test]
