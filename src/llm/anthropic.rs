@@ -18,6 +18,7 @@ impl AnthropicClient {
         // new_agent() (new_agent es metodo de Config, no de ConfigBuilder).
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_global(Some(std::time::Duration::from_secs(60)))
             .build()
             .new_agent();
         AnthropicClient {
@@ -262,6 +263,46 @@ impl Planner for AnthropicClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn servidor_sin_respuesta_agota_timeout() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            // Leer petición, sin contestar; termina cuando el cliente cierra.
+            while let Ok(n) = stream.read(&mut buffer) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let mut client = AnthropicClient::new(&format!("http://{address}"), "test", "test");
+        assert_eq!(
+            client.agent.config().timeouts().global,
+            Some(Duration::from_secs(60))
+        );
+        client.agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_millis(100)))
+            .proxy(None)
+            .build()
+            .new_agent();
+        let start = Instant::now();
+        assert!(
+            client
+                .post_once(&format!("http://{address}/messages"), &json!({}))
+                .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        server.join().unwrap();
+    }
 
     // L1 — TRAMPA 1: un bloque "text" ANTES del "tool_use". Un parser que
     // indexara content[0] fallaria aqui. Este test lo blinda.
