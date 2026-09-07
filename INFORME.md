@@ -1228,3 +1228,46 @@ Sin logs `ListToolsRequest`/`CallToolRequest` en pantalla y sin avisos `FontBBox
 
 - `cargo test`: `70 passed; 0 failed; 6 ignored` en el binario principal + `24/24` integración
 - `cargo test -- --ignored`: `6 passed; 0 failed`
+# PASO 23 - Plugins instalables (`/plugins`)
+
+## P23.1 Motivación
+
+El pre-paso documental exigía editar `~/.config/nsh/config.toml` a mano (bloque
+`[connectors.markitdown]`). Siguiendo el modelo de Claude Code (plugins),
+Gemini CLI (extensiones) y el estándar MCP (`npx -y` / `uvx` efímeros), los
+lectores documentales pasan a ser plugins: el núcleo (`!` + LLM) siempre
+funciona y el usuario activa lo opcional con un comando.
+
+## P23.2 Implementación
+
+- Nuevo `src/plugins.rs`: catálogo embebido (`documentos`: pdf/docx/xlsx vía
+  `uvx markitdown-mcp==0.0.1a4`), `install_at` / `remove_at` sobre una ruta de
+  config dada (testeable vía `NSH_CONFIG_PATH`), `check_runtime` (`<rt> --version`
+  con pista de instalación si falta), `list_lines`, `state`.
+- `install` escribe el bloque conector por el usuario (preserva `api_key`,
+  `save_to` deja `0600`); si el bloque ya existe solo lo activa. `remove` pone
+  `enabled = false` sin borrar.
+- REPL (`src/main.rs`): `/plugins list|install|remove` (+ alias
+  `uninstall/disable`). Tras cambiar, `reload_after_plugin_change()` relee el
+  config y reconstruye el broker en caliente: el segundo `/plugins list` ya
+  muestra el estado nuevo sin reiniciar.
+- `inject_document_context()` e `is_document_reference()` ya no hardcodean
+  `markitdown`: resuelven por `plugins::find_for_extension()`. Sin plugin, el
+  error es accionable (`Instálalo con: /plugins install documentos`) en vez del
+  bloque TOML. El banner de datos no confiables se neutraliza (`convertido por
+  un plugin`).
+- Tests actualizados: los dos que exigían el bloque TOML en el mensaje ahora
+  exigen `/plugins install documentos` y la ausencia del bloque.
+
+## P23.3 Salida real
+
+`cargo build`: limpio (3 warnings previos de `dead_code`, sin nuevos).
+`cargo test`: **81 passed + 24 integración = 105 verdes, 0 fallos, 6 ignored**
+(6 nuevos tests en `plugins.rs`).
+
+End-to-end con config temporal (`NSH_CONFIG_PATH`, binario real por tubería):
+`list` → `[instalado]`, `install` idempotente, `remove` → `[desactivado]` en el
+`list` siguiente (recarga en caliente verificada), `install magia` lista
+disponibles, `install` tras `remove` reactiva conservando el bloque, permisos
+`600` y `api_key` intactos.
+

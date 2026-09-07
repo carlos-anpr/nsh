@@ -2,6 +2,43 @@
 
 Wrapper en Rust sobre una **bash interactiva persistente**.
 
+La finalización de cada comando se verifica con una barrera de Bash de
+identificador aleatorio: imprimir el marcador de sesión no adelanta el prompt
+ni sustituye el código de salida real. El parser se resincroniza si encuentra
+un marcador incompleto antes del siguiente marcador válido. Esta comprobación
+protege la sincronización, no aísla código hostil que corre con los permisos
+del usuario y acceso a la propia shell.
+
+Las peticiones al proveedor LLM tienen un timeout de 60 segundos por intento,
+incluida la lectura de la respuesta. Los errores transitorios pueden reintentarse
+hasta tres veces.
+
+## 18 - Plugins instalables (`/plugins`)
+
+El núcleo (`!comandos` + LLM) siempre funciona. Las capacidades opcionales
+son plugins que se instalan con un comando, sin editar ningún fichero:
+
+```
+nsh ~ ❯ /plugins list
+  Plugins disponibles:
+    documentos lee pdf/docx/xlsx vía MarkItDown (uvx)  [no instalado]
+nsh ~ ❯ /plugins install documentos
+  ✓ plugin 'documentos' instalado (lee pdf/docx/xlsx vía MarkItDown). Ya puedes usarlo.
+```
+
+- `/plugins list` muestra el catálogo y su estado (`instalado/desactivado/no instalado`)
+- `/plugins install <nombre>` comprueba el runtime (`uvx`, `npx`, ...) en el
+  PATH, escribe el bloque `[connectors.*]` en `~/.config/nsh/config.toml`
+  (preservando `api_key` y permisos `0600`) y recarga el broker **en caliente**,
+  sin reiniciar nsh
+- `/plugins remove <nombre>` lo desactiva (`enabled = false`, se conserva el bloque)
+- Si pides un documento sin el plugin, el error dice el comando exacto:
+  `Instálalo con: /plugins install documentos`
+- Los runtimes (`uvx`/`npx -y`) resuelven en el primer uso; `install` no descarga
+  nada, igual que hacen Claude Code, Gemini CLI y OpenCode con sus MCP
+- Añadir un plugin futuro es añadir una entrada al catálogo en `src/plugins.rs`;
+  la detección por extensión (`is_document_reference`) ya tira del catálogo
+
 ## 14 - Scope de rutas y secretos
 
 La politica original por rutas se ha revertido en el PASO 19 por decision explicita del usuario. El criterio actual es por tipo de accion, no por ubicacion.
