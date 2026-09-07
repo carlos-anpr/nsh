@@ -170,7 +170,8 @@ pub fn analyze_command(cmd: &str, scope: &Scope) -> CommandAnalysis {
             analysis.set_confirm_once("puede modificar cosas");
         }
         if segment.has_unhandled_variable_or_glob {
-            analysis.set_confirm_once("usa expansiones o globs no analizables; requiere confirmacion");
+            analysis
+                .set_confirm_once("usa expansiones o globs no analizables; requiere confirmacion");
         }
         if segment.redacts_sensitive_output {
             analysis.redact_output = true;
@@ -178,7 +179,8 @@ pub fn analyze_command(cmd: &str, scope: &Scope) -> CommandAnalysis {
     }
 
     if !estructura_segura(cmd) && analysis.confirm_reason.is_none() {
-        analysis.set_confirm_once("usa una construccion que no puedo tratar como lectura automatica");
+        analysis
+            .set_confirm_once("usa una construccion que no puedo tratar como lectura automatica");
     }
 
     if !cmd.split('|').all(tramo_es_lectura) && analysis.confirm_reason.is_none() {
@@ -404,7 +406,11 @@ fn split_segments(cmd: &str, scope: &Scope) -> Vec<SegmentAnalysis> {
             continue;
         }
 
-        analysis.base = tokens[0].rsplit('/').next().unwrap_or(&tokens[0]).to_string();
+        analysis.base = tokens[0]
+            .rsplit('/')
+            .next()
+            .unwrap_or(&tokens[0])
+            .to_string();
         let in_find = analysis.base == "find";
         let mut prev_was_find_pattern = false;
         let mut saw_o = false;
@@ -952,7 +958,10 @@ mod tests {
     #[test]
     fn l23_escritura_dentro_del_root_confirma() {
         let tmp = TempDir::new().unwrap();
-        let d = evaluate(&cmd("echo hola > nota.txt", Effect::Modifies), &scope(tmp.path()));
+        let d = evaluate(
+            &cmd("echo hola > nota.txt", Effect::Modifies),
+            &scope(tmp.path()),
+        );
         assert!(
             matches!(d, Decision::Confirm(_)),
             "la política se ha vuelto demasiado estricta: una escritura legitima dentro del root debe poder confirmarse; vino {d:?}"
