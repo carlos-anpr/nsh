@@ -15,8 +15,8 @@ bind 'set enable-bracketed-paste off' 2>/dev/null
 # Eco APAGADO mientras nsh escribe el comando (nsh ya lo ha mostrado en su prompt).
 stty -echo
 
-# El nonce NO se exporta: asi ningun proceso hijo puede leerlo con `printenv`
-# y falsificar un marcador de fin de comando.
+# El nonce NO se exporta. Identifica la sesión, pero no es un secreto frente
+# a la propia Bash; execute verifica el final mediante una barrera adicional.
 # Es readonly: si el usuario pudiera vaciarlo (`unset NSH_NONCE`), nsh esperaria
 # eternamente un marcador que nunca llegaria y la sesion quedaria colgada.
 NSH_NONCE='@@NONCE@@'
@@ -45,9 +45,10 @@ __nsh_hook() {
     __nsh_cwd64=$(builtin printf %s "$PWD" | command -p base64 -w0)
     builtin printf '\033]777;nsh;%s;%s;%d;%s\007' \
         "$NSH_NONCE" \
-        "$NSH_ID" \
+        "${1:-$NSH_ID}" \
         "$__nsh_s" \
         "${__nsh_cwd64:0:5460}"
+    return "$__nsh_s"
 }
 
 PROMPT_COMMAND=__nsh_hook
@@ -257,7 +258,10 @@ impl BashSession {
         // Si vence el timeout, la sincronía está rota de forma permanente (p. ej.
         // `!exec bash` sustituyó la shell y perdió nonce y hook): la sesión ya no
         // sirve y así se le comunica al REPL vía alive()=false.
-        self.write_line(&format!("NSH_ID='{id}'"))?;
+        if let Err(e) = self.write_line(&format!("NSH_ID='{id}'")) {
+            self.alive = false;
+            return Err(e);
+        }
         if let Err(e) = self.drain_until(&id, false, Some(Duration::from_secs(5))) {
             self.alive = false;
             return Err(e);
@@ -281,19 +285,39 @@ impl BashSession {
         let handle = spawn_stdin_forwarder(self.writer.clone(), stop.clone());
 
         // FASE 3 — enviar el comando EN CRUDO (nada de llaves).
-        self.write_line(cmd)?;
+        // Mantener un único camino de limpieza, incluso si write falla.
+        let result = (|| {
+            self.write_line(cmd)?;
 
-        // FASE 4 — drenar hasta el marcador final. Sin timeout global: un comando
-        // legitimo puede tardar (sleep, top, vim). La desincronizacion se detecta
-        // por marcador ajeno (ver drain_until): cada comando solo puede emitir
-        // el marcador de su propio id.
-        let result = self.drain_until(&id, true, None);
+            // FASE 4 — drenar hasta el marcador final. Sin timeout global: un comando
+            // legitimo puede tardar (sleep, top, vim). La desincronizacion se detecta
+            // por marcador ajeno (ver drain_until): cada comando solo puede emitir
+            // el marcador de su propio id.
+            let first = self.drain_until(&id, true, None)?.unwrap();
+            // Un marcador en stdout no prueba que Bash haya vuelto al prompt.
+            // Encolar una barrera con un id nuevo, que el comando anterior no
+            // conocía. Bash solo puede ejecutarla cuando termina ese comando.
+            let fence = format!("verify{:032x}", rand::rng().random::<u128>());
+            self.write_line(&format!("__nsh_hook '{fence}'"))?;
+            let mut verified = self.drain_until(&fence, true, None)?.unwrap();
+            let mut output = first.output;
+            output.extend_from_slice(&verified.output);
+            verified.truncated |= first.truncated || output.len() > MAX_CAPTURE;
+            if output.len() > MAX_CAPTURE {
+                output.drain(..output.len() - MAX_CAPTURE);
+            }
+            verified.output = output;
+            Ok(verified)
+        })();
+        if result.is_err() {
+            self.alive = false;
+        }
 
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
         drop(_raw); // vuelve a modo cocido antes de imprimir nada
 
-        result.map(|r| r.expect("drain_until con capture=true devuelve Some"))
+        result
     }
 
     /// Consume eventos hasta ver Finished con `id`.
@@ -311,9 +335,6 @@ impl BashSession {
         let mut truncated = false;
         let stdout = std::io::stdout();
         let start = std::time::Instant::now();
-        let mut out: Vec<u8> = Vec::new();
-        let mut truncated = false;
-        let stdout = std::io::stdout();
 
         loop {
             match self.rx.recv_timeout(Duration::from_millis(100)) {
@@ -348,7 +369,7 @@ impl BashSession {
                             None
                         });
                     }
-                    if capture {
+                    if capture && !id.starts_with("verify") {
                         // En FASE 4 no puede llegar ningun otro marcador: el
                         // comando reasigno NSH_ID a mitad de ejecucion y ya no
                         // veremos el nuestro. Abortar aqui, con el terminal
@@ -389,6 +410,39 @@ impl BashSession {
 #[cfg(test)]
 mod tests {
     use super::RCFILE_TEMPLATE;
+
+    #[test]
+    fn fallo_de_escritura_cierra_sesion_y_libera_forwarder() {
+        use super::*;
+        struct FallibleWriter {
+            inner: Box<dyn Write + Send>,
+            remaining: usize,
+        }
+        impl Write for FallibleWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.remaining -= 1;
+                self.inner.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+        // Fallo al armar y fallo al enviar, después de arrancar el forwarder.
+        for remaining in [0, 2] {
+            let mut session = BashSession::start(false).unwrap();
+            let inner = std::mem::replace(
+                &mut *session.writer.lock().unwrap(),
+                Box::new(std::io::sink()),
+            );
+            *session.writer.lock().unwrap() = Box::new(FallibleWriter { inner, remaining });
+            assert!(session.execute("echo prueba").is_err());
+            assert!(!session.alive());
+            assert_eq!(Arc::strong_count(&session.writer), 1);
+        }
+    }
 
     /// El hook se emite con `builtin` y busca externos con `command -p`: sin
     /// eso, `!printf(){ :; }` o un cambio de PATH dejan el hook mudo y nsh

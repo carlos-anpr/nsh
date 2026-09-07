@@ -50,11 +50,28 @@ impl Parser {
                     // Ahora self.buf empieza por PREFIX. Buscamos el BEL de cierre.
                     match self.buf.iter().position(|&b| b == BEL) {
                         Some(end) => {
-                            let marker: Vec<u8> = self.buf.drain(..=end).collect();
-                            if let Some(ev) = self.parse_marker(&marker) {
-                                events.push(ev);
+                            let segment: Vec<u8> = self.buf.drain(..=end).collect();
+                            // Un prefijo falso (p. ej. impreso por el comando)
+                            // puede preceder al marcador real DENTRO del mismo
+                            // segmento. Si el segmento no parsea, se resincroniza:
+                            // emite como salida todo lo anterior al siguiente
+                            // PREFIX y reintenta; solo se descarta si no hay
+                            // otro marcador dentro.
+                            let mut seg: &[u8] = &segment;
+                            loop {
+                                if let Some(ev) = self.parse_marker(seg) {
+                                    events.push(ev);
+                                    break;
+                                }
+                                match find(&seg[1..], PREFIX) {
+                                    Some(offset) => {
+                                        let next = offset + 1;
+                                        events.push(Event::Output(seg[..next].to_vec()));
+                                        seg = &seg[next..];
+                                    }
+                                    None => break, // basura sin marcador: se descarta
+                                }
                             }
-                            // Si parse_marker devuelve None (nonce malo), se descarta.
                         }
                         None => {
                             if self.buf.len() > MAX_MARKER_LEN {
@@ -196,6 +213,28 @@ mod tests {
         match &ev[0] {
             Event::Finished { cwd, .. } => assert_eq!(cwd, &PathBuf::from(cwd_largo)),
             _ => panic!("el marcador con cwd largo se descarto: {:?}", ev.len()),
+        }
+    }
+
+    #[test]
+    fn prefijo_falso_sin_bel_no_pierde_el_marcador_real() {
+        // El comando imprime un prefijo de marcador sin BEL; el hook emite
+        // despues el marcador real. La salida falsa se emite como salida y el
+        // marcador real debe parsear (el parser se resincroniza).
+        let mut p = Parser::new("n1");
+        let mut data = b"basura-sin-bel\x1b]777;nsh;".to_vec();
+        data.extend(marker("n1", "c7", 3, "L3RtcA=="));
+        let ev = p.push(&data);
+        // basura emitida como salida + el prefijo falso + el marcador real.
+        assert_eq!(ev.len(), 3, "eventos: {ev:?}");
+        assert!(matches!(&ev[0], Event::Output(b) if b.starts_with(b"basura")));
+        assert!(matches!(&ev[1], Event::Output(b) if b.starts_with(PREFIX)));
+        match &ev[2] {
+            Event::Finished { id, exit_code, .. } => {
+                assert_eq!(id, "c7");
+                assert_eq!(*exit_code, 3);
+            }
+            _ => panic!("esperaba Finished"),
         }
     }
 

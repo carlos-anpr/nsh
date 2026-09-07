@@ -4,8 +4,7 @@
 //
 // Caso 24 (higiene del terminal): se automatiza por la vía del PANIC — que es
 // lo que el restore() del PASO 3 cubre de verdad — en `caso_24_panic_restaura_termios`.
-// Que `kill -TERM` NO restaura es una limitación conocida, documentada en
-// `limitacion_sigterm_no_restaura_termios`.
+// SIGTERM también restaura desde el PASO 25 (`sigterm_restaura_termios`).
 //
 // El caso 2 (la prueba decisiva del MVP) se comprueba sobre el PROMPT de nsh
 // (`nsh /tmp ❯`), no sobre la salida de `!pwd`.
@@ -278,6 +277,27 @@ fn last_prompt_cwd(b: &[u8]) -> Option<String> {
 }
 
 // ---------- casos ----------
+
+#[test]
+fn prefijo_incompleto_no_pierde_fin_real() {
+    let mut p = NshPty::new();
+    let out = p.run_cmd("builtin printf '\\033]777;nsh;basura-sin-bel'", 5000);
+    assert_eq!(last_exit(&out), Some(0));
+    assert_eq!(last_exit(&p.run_cmd("false", 5000)), Some(1));
+}
+
+#[test]
+fn marcador_valido_falso_no_adelanta_finalizacion() {
+    let mut p = NshPty::new();
+    p.send_line("!builtin printf '\\033]777;nsh;%s;%s;0;Lw==\\007' \"$NSH_NONCE\" \"$NSH_ID\"; sleep 1; echo SALIDA_REAL; false");
+    p.drain(300);
+    assert_eq!(count_terminado(&p.snapshot()), 0);
+    p.read_until(b"[terminado:", 5000, "barrera tras marcador falso");
+    p.drain(200);
+    assert_eq!(last_exit(&p.snapshot()), Some(1));
+    assert!(String::from_utf8_lossy(&p.snapshot()).contains("SALIDA_REAL"));
+    assert_eq!(last_exit(&p.run_cmd("echo SIGUIENTE", 5000)), Some(0));
+}
 
 #[test]
 fn caso_01_pwd() {
@@ -567,144 +587,6 @@ fn nonce_readonly_la_sesion_sobrevive_a_unset() {
 }
 
 #[test]
-fn hook_interno_readonly_la_sesion_sobrevive() {
-    let mut p = NshPty::new();
-    let out = p.run_cmd("unset PROMPT_COMMAND", 10_000);
-    let text = String::from_utf8_lossy(&out);
-    assert!(
-        text.contains("PROMPT_COMMAND") && text.contains("unset"),
-        "el unset deberia fallar por readonly: {text}"
-    );
-    assert_eq!(last_exit(&out), Some(1));
-    // La sesion sigue viva y sincronizada.
-    let out = p.run_cmd("echo VIVO", 10_000);
-    assert!(
-        String::from_utf8_lossy(&out).contains("VIVO"),
-        "la sesion no respondio tras el unset de PROMPT_COMMAND"
-    );
-    assert_eq!(last_exit(&out), Some(0));
-}
-
-/// `!exit` mata la shell interna: nsh debe cerrarse limpio, no seguir pintando
-/// prompts sobre una bash muerta.
-#[test]
-fn exit_interno_cierra_nsh() {
-    let mut p = NshPty::new();
-    p.send_line("!exit");
-    p.wait_for_exit(10_000);
-    let snap = p.snapshot();
-    let text = String::from_utf8_lossy(&snap);
-    assert!(
-        text.contains("la shell ha terminado") || text.contains("cerrando nsh"),
-        "se esperaba el mensaje de cierre tras !exit: {text}"
-    );
-    // wait_for_exit solo vence por timeout si nsh sigue vivo: si llegamos aqui
-    // con el canal desconectado, nsh termino. Comprobacion explicita: pedir
-    // mas datos no puede traer un nuevo prompt.
-    let n_antes = p.snapshot().len();
-    p.drain(300);
-    assert_eq!(p.snapshot().len(), n_antes, "nsh sigue vivo tras !exit");
-}
-
-/// `!exec bash` sustituye la shell interna: pierde el nonce y el hook, asi que
-/// la sincronia se rompe para siempre. nsh debe detectarlo (timeout de la fase
-/// de armado) y cerrar, no quedarse colgado ni pintar prompts muertos.
-#[test]
-fn exec_bash_cierra_nsh_por_perdida_de_sincronia() {
-    let mut p = NshPty::new();
-    p.send_line("!exec bash");
-    p.wait_for_exit(15_000);
-    // Si llegamos aqui, nsh termino (el canal se desconecto): correcto.
-    p.drain(300);
-}
-
-/// Un cwd muy profundo (cerca de PATH_MAX) se codifica en Base64 dentro del
-/// marcador: el marcador legitimo mas grande posible no debe descartarse ni
-/// colgar la sesion.
-#[test]
-fn cwd_profundo_el_marcador_no_se_descarta() {
-    let base = std::env::temp_dir().join(format!("nsh-deep-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-
-    // Componentes de 60 chars hasta rondar PATH_MAX (4096, total): base64 del
-    // cwd (~5400 bytes) excede el limite antiguo de 4096 del parser. No se
-    // crea fichero dentro: el propio cwd ya deja el camino al limite.
-    let mut dir = base.clone();
-    let comp = "d".repeat(60);
-    while dir.as_os_str().len() + 1 + comp.len() <= 4090 {
-        dir.push(&comp);
-        std::fs::create_dir(&dir).unwrap();
-    }
-    assert!(
-        dir.as_os_str().len() > 4000,
-        "el cwd de prueba deberia rondar PATH_MAX: {}",
-        dir.as_os_str().len()
-    );
-
-    let mut p = NshPty::new_with_cwd(dir.clone());
-    let out = p.run_cmd("echo ENCONTRADO", 10_000);
-    let text = String::from_utf8_lossy(&out);
-    assert_eq!(last_exit(&out), Some(0), "el comando fallo en cwd profundo: {text}");
-    assert!(text.contains("ENCONTRADO"));
-    let _ = std::fs::remove_dir_all(&base);
-}
-
-/// El hook usa `builtin printf` y `command -p stty/base64`: una función del
-/// usuario que sombree `printf` no deja el hook mudo (antes nsh quedaba
-/// esperando eternamente el marcador de fin de ese comando).
-#[test]
-fn hook_sobrevive_a_sombra_de_printf() {
-    let mut p = NshPty::new();
-    // Antes del endurecimiento, ESTE comando ya no recibia marcador: el hook
-    // llamaba al printf sombreado y run_cmd agotaba su timeout.
-    let out = p.run_cmd("printf(){ :; }", 10_000);
-    assert_eq!(last_exit(&out), Some(0));
-    let out = p.run_cmd("echo VIVO", 10_000);
-    assert!(
-        String::from_utf8_lossy(&out).contains("VIVO"),
-        "la sesion no respondio tras sombrear printf"
-    );
-    assert_eq!(last_exit(&out), Some(0));
-}
-
-/// `command -p` busca stty/base64 en el PATH por defecto del sistema: un PATH
-/// inutilizado por el usuario tampoco rompe el hook.
-#[test]
-fn hook_sobrevive_a_path_inutilizado() {
-    let mut p = NshPty::new();
-    let out = p.run_cmd("PATH=/no/existe", 10_000);
-    assert_eq!(last_exit(&out), Some(0));
-    let out = p.run_cmd("echo VIVO", 10_000);
-    assert!(
-        String::from_utf8_lossy(&out).contains("VIVO"),
-        "la sesion no respondio con PATH roto"
-    );
-    assert_eq!(last_exit(&out), Some(0));
-    // Restablecer para no dejar la sesión coja.
-    let _ = p.run_cmd("PATH=$PATH", 10_000);
-}
-
-/// Un PWD artificial gigante (variable, sin límite de PATH_MAX) no puede
-/// superar el MAX_MARKER_LEN del parser: el hook corta su Base64 y el marcador
-/// siempre cabe. Antes, el parser descartaba el marcador como basura y nsh se
-/// quedaba esperando el fin de comando para siempre.
-#[test]
-fn pwd_artificial_gigante_no_rompe_el_marcador() {
-    let mut p = NshPty::new();
-    let out = p.run_cmd("PWD=$(printf 'a%.0s' {1..20000})", 10_000);
-    assert_eq!(last_exit(&out), Some(0));
-    // El marcador llegó (run_cmd no agotó timeout) y la sesión sigue viva.
-    let out = p.run_cmd("echo VIVO", 10_000);
-    assert!(
-        String::from_utf8_lossy(&out).contains("VIVO"),
-        "la sesion no respondio tras el PWD gigante"
-    );
-    assert_eq!(last_exit(&out), Some(0));
-    let _ = p.run_cmd("cd /tmp", 10_000);
-}
-
-#[test]
 fn caso_23_exit_cierra_limpio() {
     let mut p = NshPty::new();
     p.buf.clear();
@@ -813,6 +695,153 @@ fn sigterm_restaura_termios() {
         cocido,
         "SIGTERM NO restauró los termios: el esclavo quedó en raw mode"
     );
+}
+
+/// El hook interno (PROMPT_COMMAND/__nsh_hook) es readonly: intentar quitarlo
+/// falla dentro de bash y la sesión sigue viva y sincronizada. Antes de hacerlo
+/// readonly, `!unset PROMPT_COMMAND` eliminaba el emisor de marcadores y nsh se
+/// quedaba esperando el fin de comando para siempre (FASE 4 no tiene timeout,
+/// a propósito, para admitir `sleep`, `top`, `vim`...).
+#[test]
+fn hook_interno_readonly_la_sesion_sobrevive() {
+    let mut p = NshPty::new();
+    let out = p.run_cmd("unset PROMPT_COMMAND", 10_000);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("PROMPT_COMMAND") && text.contains("unset"),
+        "el unset deberia fallar por readonly: {text}"
+    );
+    assert_eq!(last_exit(&out), Some(1));
+    // La sesion sigue viva y sincronizada.
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio tras el unset de PROMPT_COMMAND"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+}
+
+/// El hook usa `builtin printf` y `command -p stty/base64`: una función del
+/// usuario que sombree `printf` no deja el hook mudo (antes nsh quedaba
+/// esperando eternamente el marcador de fin de ese comando).
+#[test]
+fn hook_sobrevive_a_sombra_de_printf() {
+    let mut p = NshPty::new();
+    // Antes del endurecimiento, ESTE comando ya no recibia marcador: el hook
+    // llamaba al printf sombreado y run_cmd agotaba su timeout.
+    let out = p.run_cmd("printf(){ :; }", 10_000);
+    assert_eq!(last_exit(&out), Some(0));
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio tras sombrear printf"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+}
+
+/// `command -p` busca stty/base64 en el PATH por defecto del sistema: un PATH
+/// inutilizado por el usuario tampoco rompe el hook.
+#[test]
+fn hook_sobrevive_a_path_inutilizado() {
+    let mut p = NshPty::new();
+    let out = p.run_cmd("PATH=/no/existe", 10_000);
+    assert_eq!(last_exit(&out), Some(0));
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio con PATH roto"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+    // Restablecer para no dejar la sesión coja.
+    let _ = p.run_cmd("PATH=$PATH", 10_000);
+}
+
+/// Un PWD artificial gigante (variable, sin límite de PATH_MAX) no puede
+/// superar el MAX_MARKER_LEN del parser: el hook corta su Base64 y el marcador
+/// siempre cabe. Antes, el parser descartaba el marcador como basura y nsh se
+/// quedaba esperando el fin de comando para siempre.
+#[test]
+fn pwd_artificial_gigante_no_rompe_el_marcador() {
+    let mut p = NshPty::new();
+    let out = p.run_cmd("PWD=$(printf 'a%.0s' {1..20000})", 10_000);
+    assert_eq!(last_exit(&out), Some(0));
+    // El marcador llegó (run_cmd no agotó timeout) y la sesión sigue viva.
+    let out = p.run_cmd("echo VIVO", 10_000);
+    assert!(
+        String::from_utf8_lossy(&out).contains("VIVO"),
+        "la sesion no respondio tras el PWD gigante"
+    );
+    assert_eq!(last_exit(&out), Some(0));
+    let _ = p.run_cmd("cd /tmp", 10_000);
+}
+
+/// `!exit` mata la shell interna: nsh debe cerrarse limpio, no seguir pintando
+/// prompts sobre una bash muerta.
+#[test]
+fn exit_interno_cierra_nsh() {
+    let mut p = NshPty::new();
+    p.send_line("!exit");
+    p.wait_for_exit(10_000);
+    let snap = p.snapshot();
+    let text = String::from_utf8_lossy(&snap);
+    assert!(
+        text.contains("la shell ha terminado") || text.contains("cerrando nsh"),
+        "se esperaba el mensaje de cierre tras !exit: {text}"
+    );
+    // wait_for_exit solo vence por timeout si nsh sigue vivo: si llegamos aquí
+    // con el canal desconectado, nsh terminó. Comprobación explícita: pedir
+    // más datos no puede traer un nuevo prompt.
+    let n_antes = p.snapshot().len();
+    p.drain(300);
+    assert_eq!(p.snapshot().len(), n_antes, "nsh sigue vivo tras !exit");
+}
+
+/// `!exec bash` sustituye la shell interna: pierde el nonce y el hook, así que
+/// la sincronía se rompe para siempre. nsh debe detectarlo (timeout de la fase
+/// de armado) y cerrar, no quedarse colgado ni pintar prompts muertos.
+#[test]
+fn exec_bash_cierra_nsh_por_perdida_de_sincronia() {
+    let mut p = NshPty::new();
+    p.send_line("!exec bash");
+    p.wait_for_exit(15_000);
+    // Si llegamos aquí, nsh terminó (el canal se desconectó): correcto.
+    p.drain(300);
+}
+
+/// Un cwd muy profundo (cerca de PATH_MAX) se codifica en Base64 dentro del
+/// marcador: el marcador legitimo más grande posible no debe descartarse ni
+/// colgar la sesión.
+#[test]
+fn cwd_profundo_el_marcador_no_se_descarta() {
+    let base = std::env::temp_dir().join(format!("nsh-deep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    // Componentes de 60 chars hasta rondar PATH_MAX (4096, total): base64 del
+    // cwd (~5400 bytes) excede el limite antiguo de 4096 del parser. No se
+    // crea fichero dentro: el propio cwd ya deja el camino al limite.
+    let mut dir = base.clone();
+    let comp = "d".repeat(60);
+    while dir.as_os_str().len() + 1 + comp.len() <= 4090 {
+        dir.push(&comp);
+        std::fs::create_dir(&dir).unwrap();
+    }
+    assert!(
+        dir.as_os_str().len() > 4000,
+        "el cwd de prueba deberia rondar PATH_MAX: {}",
+        dir.as_os_str().len()
+    );
+
+    let mut p = NshPty::new_with_cwd(dir.clone());
+    let out = p.run_cmd("echo ENCONTRADO", 10_000);
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        last_exit(&out),
+        Some(0),
+        "el comando fallo en cwd profundo: {text}"
+    );
+    assert!(text.contains("ENCONTRADO"));
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 // ---------- FASE 2 ----------
